@@ -1,0 +1,129 @@
+using LinearAlgebra, Statistics, Plots, Random
+
+# ===========================
+# Hankel helpers (1D)
+# ===========================
+# Sestavi Hankelovo matriko iz vektorja d.
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = fld(L, 2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            H[i, j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+# Inverzni Hankelov operator: povpreči elemente vzdolž antidiagonale.
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i, j]
+            counts[k] += 1
+        end
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# ===========================
+# OS11 core: single-pass MSSA
+# ===========================
+# En prehod MSSA z znižanjem ranga.
+# VRNE: (očiščeni_signal, r_used)
+function mssa_denoise(d::Vector{T}, R::Int) where T
+    D = hankel_matrix(d)
+    F = svd(D)
+    U, S, Vt = F.U, F.S, F.Vt
+    r_used = min(R, length(S))
+    D_denoised = U[:, 1:r_used] * Diagonal(S[1:r_used]) * Vt[1:r_used, :]
+    d_est = inv_hankel(D_denoised)
+    return d_est, r_used
+end
+
+# ===========================
+# OS11 iterative denoising ONLY (no reconstruction, no α-blending)
+# ===========================
+# Čista iteracija: d_m = F(d_{m-1})
+# Če podate clean_ref, vrne tudi zgodovino SNR po iteracijah.
+function mssa_denoise_iter_pure(d_obs::Vector{T}, R::Int; mmax::Int=6, clean_ref::Union{Nothing,Vector{T}}=nothing) where T
+    d_m = copy(d_obs)
+    snr_hist = Float64[]
+    for m in 1:mmax
+        d_m, _ = mssa_denoise(d_m, R)
+        if clean_ref !== nothing
+            push!(snr_hist, 10 * log10(norm(clean_ref)^2 / norm(clean_ref - d_m)^2))
+        end
+    end
+    return d_m, snr_hist
+end
+
+# ===========================
+# Merilo kakovosti
+# ===========================
+function compute_snr(C::Vector{T}, A::Vector{T}) where T
+    10 * log10(norm(C)^2 / norm(C - A)^2)
+end
+
+# ===========================
+# Demo / test
+# ===========================
+# Sintetičen čist signal
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+
+# Dodaj šum
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Parametri
+R = 2           # ciljni rang za MSSA
+mmax = 6        # št. iteracij OS11 (čista iteracija)
+
+# En prehod (baseline)
+elapsed_once = @elapsed begin
+    denoised_once, r_used = mssa_denoise(noisy_signal, R)
+end
+snr_once = compute_snr(clean_signal, denoised_once)
+println("MSSA en prehod: r_used = $r_used, SNR = $(round(snr_once, digits=3)) dB, čas = $(round(elapsed_once, digits=4)) s")
+
+# Iterativni OS11 denoising (čisto F∘F∘...∘F)
+elapsed_iter = @elapsed begin
+    denoised_iter, snr_hist = mssa_denoise_iter_pure(noisy_signal, R; mmax=mmax, clean_ref=clean_signal)
+end
+best_it = !isempty(snr_hist) ? argmax(snr_hist) : 0
+best_snr = !isempty(snr_hist) ? snr_hist[best_it] : NaN
+println("OS11 iterativno (čista iteracija): najboljši SNR = $(round(best_snr, digits=3)) dB pri iteraciji $best_it, čas = $(round(elapsed_iter, digits=4)) s")
+
+# ===========================
+# Vizualizacija
+# ===========================
+# Signali
+p1 = plot(t, clean_signal, label="Čisti signal", lw=2)
+plot!(p1, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p1, t, denoised_once, label="MSSA en prehod", lw=2, ls=:dot)
+plot!(p1, t, denoised_iter, label="MSSA iterativno ($(mmax))", lw=2, ls=:dashdot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("OS11/MSSA denoising (en prehod vs. čista iteracija)")
+display(p1)
+# savefig(p1, "os11_signali.png")  # neobvezno
+
+# SNR po iteracijah
+p2 = plot(1:length(snr_hist), snr_hist, marker=:circle, lw=2, label="SNR")
+if !isempty(snr_hist)
+    vline!(p2, [best_it], ls=:dash, label="Najboljša iteracija = $best_it")
+    annotate!(p2, (best_it, best_snr), text("max $(round(best_snr, digits=2)) dB", 8, :left))
+end
+xlabel!("Iteracija"); ylabel!("SNR (dB)"); title!("Napredek SNR skozi iteracije (OS11 – čista iteracija)")
+display(p2)
+# savefig(p2, "os11_snr_vs_iter.png")  # neobvezno

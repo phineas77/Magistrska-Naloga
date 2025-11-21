@@ -1,0 +1,126 @@
+using LinearAlgebra, Statistics, Plots, Random
+
+# ===========================
+# Hankel helpers (1D)
+# ===========================
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = fld(L, 2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            H[i, j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i, j]
+            counts[k] += 1
+        end
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# ===========================
+# OS11 core: single-pass MSSA
+# ===========================
+function mssa_denoise(d::Vector{T}, R::Int) where T
+    D = hankel_matrix(d)
+    F = svd(D)
+    U, S, Vt = F.U, F.S, F.Vt
+    r_used = min(R, length(S))
+    D_denoised = U[:, 1:r_used] * Diagonal(S[1:r_used]) * Vt[1:r_used, :]
+    d_est = inv_hankel(D_denoised)
+    return d_est, r_used
+end
+
+# ===========================
+# Pure iterative MSSA (no α, no reconstruction)
+# ===========================
+function mssa_denoise_iter_pure(d_obs::Vector{T}, R::Int; mmax::Int=6) where T
+    d_m = copy(d_obs)
+    for _ in 1:mmax
+        d_m, _ = mssa_denoise(d_m, R)
+    end
+    return d_m
+end
+
+# ===========================
+# Metric
+# ===========================
+compute_snr(C::Vector{T}, A::Vector{T}) where T = 10 * log10(norm(C)^2 / norm(C - A)^2)
+
+# ===========================
+# Demo / test
+# ===========================
+# Synthetic clean signal
+t = 1:50
+clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+
+# Add noise
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Fixed rank
+R = 2
+
+# Baseline: single pass
+denoised_once, r_used = mssa_denoise(noisy_signal, R)
+snr_once = compute_snr(clean_signal, denoised_once)
+println("MSSA en prehod: r_used = $r_used, SNR = $(round(snr_once, digits=3)) dB")
+
+# Sweep iterations 1..100
+iters = 1:100
+snr_vs_iter = zeros(Float64, length(iters))
+denoised_by_iter = Vector{Vector{Float64}}(undef, length(iters))
+
+for (idx, mmax) in enumerate(iters)
+    d_est = mssa_denoise_iter_pure(noisy_signal, R; mmax=mmax)
+    snr_vs_iter[idx] = compute_snr(clean_signal, d_est)
+    denoised_by_iter[idx] = d_est
+end
+
+best_idx = argmax(snr_vs_iter)
+best_it  = iters[best_idx]
+best_snr = snr_vs_iter[best_idx]
+println("Najboljša iteracija: m = $best_it, SNR = $(round(best_snr, digits=4)) dB")
+
+# ===========================
+# Plots
+# ===========================
+# Signals at best iteration (vs. noisy and single-pass)
+best_denoised = denoised_by_iter[best_idx]
+p1 = plot(t, clean_signal, label="Čisti signal", lw=2)
+plot!(p1, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p1, t, denoised_once, label="MSSA en prehod (R=2)", lw=2, ls=:dot)
+plot!(p1, t, best_denoised, label="MSSA $best_it iteracij (R=2)", lw=2, ls=:dashdot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("MSSA razšumljanje – najboljša iteracija (R=2)")
+display(p1)
+# savefig(p1, "os11_best_iter_signals.png")
+
+# SNR vs iteration
+p2 = plot(iters, snr_vs_iter, marker=:circle, lw=2, label="SNR (R=2)")
+vline!(p2, [best_it], ls=:dash, label="Najboljša iteracija = $best_it")
+annotate!(p2, (best_it, best_snr), text("max $(round(best_snr, digits=2)) dB", 8, :left))
+xlabel!("Število iteracij"); ylabel!("SNR (dB)")
+title!("SNR glede na število iteracij (R=2)")
+display(p2)
+# savefig(p2, "os11_snr_vs_iterations.png")
+
+plt = plot(p2, p1; layout=(2,1), size=(900,700))
+display(plt)
+savefig(plt, "os11_mssa_iter.pdf")

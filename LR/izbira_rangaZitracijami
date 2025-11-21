@@ -1,0 +1,130 @@
+using LinearAlgebra, Statistics, Plots, Random
+
+# ===========================
+# Hankel helpers (1D)
+# ===========================
+# Sestavi Hankelovo matriko iz vektorja d.
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = fld(L, 2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            H[i, j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+# Inverzni Hankelov operator: povpreči elemente vzdolž antidiagonale.
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i, j]
+            counts[k] += 1
+        end
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# ===========================
+# OS11 core: single-pass MSSA
+# ===========================
+# En prehod MSSA z znižanjem ranga.
+# VRNE: (očiščeni_signal, r_used)
+function mssa_denoise(d::Vector{T}, R::Int) where T
+    D = hankel_matrix(d)
+    F = svd(D)
+    U, S, Vt = F.U, F.S, F.Vt
+    r_used = min(R, length(S))
+    D_denoised = U[:, 1:r_used] * Diagonal(S[1:r_used]) * Vt[1:r_used, :]
+    d_est = inv_hankel(D_denoised)
+    return d_est, r_used
+end
+
+# ===========================
+# Čista iteracija: d_m = F(d_{m-1}) (no α, no reconstruction)
+# ===========================
+function mssa_denoise_iter_pure(d_obs::Vector{T}, R::Int; mmax::Int=6) where T
+    d_m = copy(d_obs)
+    for _ in 1:mmax
+        d_m, _ = mssa_denoise(d_m, R)
+    end
+    return d_m
+end
+
+# ===========================
+# Merilo kakovosti
+# ===========================
+compute_snr(C::Vector{T}, A::Vector{T}) where T = 10 * log10(norm(C)^2 / norm(C - A)^2)
+
+# ===========================
+# Demo / test
+# ===========================
+# Sintetičen čist signal
+t = 1:50
+clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+
+# Dodaj šum
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Iteracije so fiksne na 6
+mmax = 6
+
+# Informativno: maksimalno možen rang (min(M, N)) za podano Hankelovo matriko
+D0 = hankel_matrix(noisy_signal)
+rmax = length(svd(D0).S)
+println("Max možni rang (min(M,N)) = $rmax")
+
+# Sweeptaj R = 1..100, pri čemer bo algoritem samodejno uporabil r_used = min(R, rmax)
+rangi = 1:100
+snr_vals = zeros(Float64, length(rangi))
+denoised_by_rank = Vector{Vector{Float64}}(undef, length(rangi))
+
+for (idx, R) in enumerate(rangi)
+    d_est = mssa_denoise_iter_pure(noisy_signal, R; mmax=mmax)
+    snr_vals[idx] = compute_snr(clean_signal, d_est)
+    denoised_by_rank[idx] = d_est
+end
+
+best_idx = argmax(snr_vals)
+best_R = rangi[best_idx]
+best_SNR = snr_vals[best_idx]
+println("Najboljši rang v 1..100: R = $best_R, SNR = $(round(best_SNR, digits=4)) dB (po $mmax iteracijah)")
+
+# ===========================
+# Vizualizacija: signali (za najboljši rang)
+# ===========================
+best_denoised = denoised_by_rank[best_idx]
+p1 = plot(t, clean_signal, label="Čisti signal", lw=2)
+plot!(p1, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p1, t, best_denoised, label="MSSA (R=$best_R, $mmax iter.)", lw=2, ls=:dot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("OS11/MSSA denoising – najboljši rang")
+display(p1)
+# savefig(p1, "os11_best_rank_signali.png")  # neobvezno
+
+# ===========================
+# Vizualizacija: SNR vs. rang
+# ===========================
+p2 = plot(rangi, snr_vals, lw=2, marker=:circle, label="SNR po $mmax iteracijah")
+vline!(p2, [best_R], ls=:dash, label="Najboljši rang = $best_R")
+annotate!(p2, (best_R, best_SNR), text("max $(round(best_SNR, digits=2)) dB", 8, :left))
+xlabel!("Rang MSSA")
+ylabel!("SNR (dB)")
+title!("SNR glede na rang (1..100), iteracije = $mmax")
+display(p2)
+# savefig(p2, "os11_snr_vs_rank.png")  # neobvezno
+
+plt = plot(p2, p1; layout = (2,1), size = (900,700))
+savefig(plt, "mssa_iter6_combined.pdf")

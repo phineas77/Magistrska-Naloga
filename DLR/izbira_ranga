@@ -1,0 +1,242 @@
+using LinearAlgebra, Statistics, Random, Plots, Measures
+
+# --- 1D Damped Rank Reduction (SSA-style) ---
+
+# Construct a Hankel matrix from a 1D vector d.
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = fld(L, 2) + 1                  # ≈ L/2 + 1, near-square window
+    N = L - M + 1
+    H = Matrix{float(T)}(undef, M, N)  # use floating container (handles Int/Complex)
+    @inbounds for i in 1:M, j in 1:N
+        H[i, j] = d[i + j - 1]
+    end
+    return H
+end
+
+# Inverse Hankel operator: reconstruct a vector by averaging along anti-diagonals.
+function inv_hankel(H::AbstractMatrix)
+    M, N = size(H)
+    L = M + N - 1
+    T = float(eltype(H))
+    d_est = zeros(T, L)              # ensure floating division
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M, j in 1:N
+        k = i + j - 1
+        d_est[k] += H[i, j]
+        counts[k] += 1
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# Damped TSVD: SVD, truncate to rank K, apply damping operator.
+function damped_tsvd(M::AbstractMatrix, K::Int, damp::Real)
+    F = svd(M; full=false)                # returns U, S, Vt
+    r = min(K, length(F.S))
+    S1 = F.S[1:r]
+    S2 = F.S[r+1:end]
+    δ̂ = isempty(S2) ? zero(eltype(S1)) : maximum(S2)
+
+    # Guard against tiny/zero singular values; build damping vector and clamp to [0,1]
+    S1safe = max.(S1, eps(eltype(S1)))
+    t = 1 .- (δ̂^damp) .* (S1safe .^ (-damp))   # entries of T on the diagonal
+    t = clamp.(t, 0, 1)
+    Td = Diagonal(t)
+
+    U1  = F.U[:, 1:r]
+    Σ1  = Diagonal(S1)
+    V1t = F.Vt[1:r, :]                         # this is V1' already
+    return U1 * (Σ1 * Td) * V1t
+end
+
+# 1D Damped Rank Reduction: Hankelization → damped TSVD → inverse Hankel.
+function damped_rank_reduction_1d(d::Vector, K::Int, damp::Real)
+    D = hankel_matrix(d)
+    M_damped = damped_tsvd(D, K, damp)
+    d_est = inv_hankel(M_damped)
+    return d_est
+end
+
+# Function to compute SNR: 10*log10(||C||^2 / ||C - A||^2)
+compute_snr(clean::Vector, estimated::Vector) =
+    10 * log10(sum(abs2, clean) / sum(abs2, clean .- estimated))
+
+# --- ITERACIJE (fiksni rang K, brez adaptivnega izbora) ---
+# Čista iteracija filtra: d_{m+1} = Fd(d_m)
+# - mmax: število iteracij
+# - clean_ref: če podaš referenco, vrača tudi SNR zgodovino
+function dlr_denoise_iter(
+    d_obs::AbstractVector, K::Int, damp::Real;
+    mmax::Int=6,
+    clean_ref::Union{Nothing,AbstractVector}=nothing,
+    verbose::Bool=true
+)
+    d = copy(d_obs)
+    snr_hist = Float64[]
+    for m in 1:mmax
+        d = damped_rank_reduction_1d(d, K, damp)
+        if clean_ref !== nothing
+            push!(snr_hist, compute_snr(clean_ref, d))
+            verbose && println("Iteracija $m: SNR = $(round(snr_hist[end], digits=3)) dB")
+        else
+            verbose && println("Iteracija $m: končano")
+        end
+    end
+    return d, snr_hist
+end
+
+# --- Test signal (1D) ---
+
+# Define the time axis and a clean test signal.
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+
+# Add random Gaussian noise.
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Set parameters for damped rank reduction.
+K = 2      # fixed target rank (no adaptive)
+damp = 2   # damping exponent (N)
+
+# --- Single pass (baseline) ---
+elapsed_time = @elapsed denoised_once = damped_rank_reduction_1d(noisy_signal, K, damp)
+snr_once = compute_snr(clean_signal, denoised_once)
+println("EN PREHOD: SNR = $(round(snr_once, digits=3)) dB, čas = $(round(elapsed_time, digits=4)) s")
+
+# --- Iterative denoising (pure F∘F∘…; fixed K) ---
+mmax = 6
+elapsed_iter = @elapsed begin
+    denoised_iter, snr_hist = dlr_denoise_iter(noisy_signal, K, damp;
+        mmax=mmax, clean_ref=clean_signal, verbose=true)
+end
+best_it = isempty(snr_hist) ? 0 : argmax(snr_hist)
+best_snr = isempty(snr_hist) ? NaN : snr_hist[best_it]
+println("ITERACIJE: najboljši SNR = $(round(best_snr, digits=3)) dB pri iteraciji $best_it; čas = $(round(elapsed_iter, digits=4)) s")
+
+# --- Plots: baseline vs. iterative ---
+p1 = plot(t, clean_signal, label="Čisti signal", lw=2)
+plot!(p1, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p1, t, denoised_once, label="dMSSA en prehod", lw=2, ls=:dot)
+plot!(p1, t, denoised_iter, label="dMSSA iterativno ($(mmax))", lw=2, ls=:dashdot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("dMSSA (en prehod vs. iterativno)")
+display(p1)
+
+p2 = plot(1:length(snr_hist), snr_hist, marker=:circle, lw=2, label="SNR")
+if !isempty(snr_hist)
+    vline!(p2, [best_it], ls=:dash, label="Najboljša iteracija = $best_it")
+    annotate!(p2, (best_it, best_snr), text("max $(round(best_snr, digits=2)) dB", 8, :left))
+end
+xlabel!("Iteracija"); ylabel!("SNR (dB)"); title!("Napredek SNR skozi iteracije (dMSSA– fiksni rang)")
+display(p2)
+
+# ===========================
+# Iskanje najboljše izbire ranga K (1..100 ali do rank_limit)
+# ===========================
+M = fld(length(clean_signal), 2) + 1
+N = length(clean_signal) - M + 1
+rank_limit = min(M, N)
+
+Kmax = min(100, rank_limit)
+R_candidates = collect(1:Kmax)
+
+println("\n--- Iskanje najboljšega ranga ---")
+println("rank_limit = $rank_limit; testiram K ∈ 1:$Kmax")
+
+mmax_search = 6
+
+snr_single = zeros(Float64, length(R_candidates))
+snr_iter_best = zeros(Float64, length(R_candidates))
+best_iter_at_R = zeros(Int, length(R_candidates))
+
+for (idx, Ktest) in enumerate(R_candidates)
+    # En prehod
+    d1 = damped_rank_reduction_1d(noisy_signal, Ktest, damp)
+    snr_single[idx] = compute_snr(clean_signal, d1)
+
+    # Iterativno: vzemi NAJBOLJŠI SNR čez iteracije
+    _, snr_hist_R = dlr_denoise_iter(noisy_signal, Ktest, damp;
+                                     mmax=mmax_search, clean_ref=clean_signal, verbose=false)
+    snr_iter_best[idx] = isempty(snr_hist_R) ? NaN : maximum(snr_hist_R)
+    best_iter_at_R[idx] = isempty(snr_hist_R) ? 0 : argmax(snr_hist_R)
+end
+
+# Najboljši K (en prehod)
+i_best_single = argmax(snr_single)
+K_best_single = R_candidates[i_best_single]
+SNR_best_single = snr_single[i_best_single]
+
+# Najboljši K (iterativno)
+i_best_iter = argmax(snr_iter_best)
+K_best_iter = R_candidates[i_best_iter]
+SNR_best_iter = snr_iter_best[i_best_iter]
+best_it_for_bestK = best_iter_at_R[i_best_iter]
+
+println("Najboljši rang (EN PREHOD): K* = $K_best_single, SNR = $(round(SNR_best_single, digits=3)) dB")
+println("Najboljši rang (ITERATIVNO, mmax=$(mmax_search)): K* = $K_best_iter, ",
+        "najboljši SNR = $(round(SNR_best_iter, digits=3)) dB pri iteraciji $best_it_for_bestK")
+
+# (Neobvezno) pokaži še denoised rezultate za najboljša K
+den_best_single = damped_rank_reduction_1d(noisy_signal, K_best_single, damp)
+den_best_iter, _ = dlr_denoise_iter(noisy_signal, K_best_iter, damp;
+                                    mmax=mmax_search, clean_ref=clean_signal, verbose=false)
+
+# Graf SNR vs. K
+pK = plot(R_candidates, snr_single; label="En prehod", lw=2, marker=:circle)
+plot!(pK, R_candidates, snr_iter_best; label="Iterativno (max čez iter.)", lw=2, marker=:diamond)
+vline!(pK, [K_best_single]; ls=:dash, label="K*_single")
+vline!(pK, [K_best_iter]; ls=:dashdot, label="K*_iter")
+xlabel!("Rang K"); ylabel!("SNR (dB)"); title!("Izbira najboljšega ranga K")
+display(pK)
+
+# (Neobvezno) primerjava signalov za najboljša K
+p_show = plot(t, clean_signal, label="Čisti", lw=2)
+plot!(p_show, t, noisy_signal, label="Šumni", lw=2, ls=:dash)
+plot!(p_show, t, den_best_single, label="Z dušenjem (en prehod, K=$(K_best_single))", lw=2, ls=:dot)
+plot!(p_show, t, den_best_iter,   label="Z dušenjem (iter, K=$(K_best_iter), m=$(mmax_search))", lw=2, ls=:dashdot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("Najboljši rang — primerjava signalov")
+display(p_show)
+
+
+using Plots: @layout
+
+# FIGURE 1 — prvih 3 grafe v istem layoutu kot prej (p1; p2 | pK)
+lyt_first3 = @layout [a; b c]
+fig_first3 = plot(p1, p2, pK;
+    layout = lyt_first3,
+    size = (1200, 1400),
+    left_margin   = 14mm,
+    right_margin  = 8mm,
+    top_margin    = 10mm,
+    bottom_margin = 12mm
+)
+savefig(fig_first3, "dlr_first302.pdf")
+
+# FIGURE 2 — 4. graf (p_show) kot samostojen figure
+fig_fourth = plot(p_show;
+    size = (1200, 700),
+    left_margin   = 14mm,
+    right_margin  = 8mm,
+    top_margin    = 10mm,
+    bottom_margin = 12mm
+)
+savefig(fig_fourth, "dlr_fourth02.pdf")
+
+# lyt = @layout [a; b c; d]   # 1. vrstica: p1 čez celo širino
+#                            # 2. vrstica: p2 | pK
+#                            # 3. vrstica: p_show čez celo širino
+
+# plt_all = plot(p1, p2, pK, p_show;
+#     layout = lyt,
+#     size = (1200, 1600),
+#     left_margin   = 14mm,
+#     right_margin  = 8mm,
+#     top_margin    = 10mm,
+#     bottom_margin = 12mm
+# )
+
+# savefig(plt_all, "dlr_all_plots.pdf")

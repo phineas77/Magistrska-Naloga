@@ -1,0 +1,170 @@
+using Random
+using LinearAlgebra
+using Statistics
+using Plots
+using LaTeXStrings
+using Printf
+
+
+# Funkcija za konstrukcijo Hankelove matrike iz vektorja d. V redu!
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = floor(Int, L/2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    for i in 1:M
+        for j in 1:N
+            H[i,j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+# Funkcija za inverz Hankelove transformacije: povpreči elemente vzdolž antidiagonal.
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    for i in 1:M
+        for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i,j]
+            counts[k] += 1
+        end
+    end
+    for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# Funkcija za projekcijo matrike na Hankelovo strukturo z izenačenjem vrednosti antidiagonal.
+function proj_hankel(A::AbstractMatrix{T}) where T
+    M, N = size(A)
+    H_proj = similar(A)
+    L = M + N - 1
+    for k in 1:L
+        vals = T[]
+        for i in 1:M
+            j = k - i + 1
+            if j >= 1 && j <= N
+                push!(vals, A[i,j])
+            end
+        end
+        avg_val = mean(vals)
+        for i in 1:M
+            j = k - i + 1
+            if j >= 1 && j <= N
+                H_proj[i,j] = avg_val
+            end
+        end
+    end
+    return H_proj
+end
+
+# Funkcija za adaptiven izbor ranga in nizkorang aproksimacijo z uporabo SVD
+function adaptive_proj_low_rank(A::AbstractMatrix{T}) where T
+    M, N = size(A)
+    ratio = M / N
+    c_val = 0.56 * ratio^3 - 0.95 * ratio^2 + 1.82 * ratio + 1.43
+    U, S, V = svd(A)
+    sigma_med = median(S)
+    R = count(x -> x >= c_val * sigma_med, S)
+    println("Uporabljen rank: ", R)
+    # Če nobena singularna vrednost ne preseže praga, vrnemo ničelno matriko.
+    if R == 0
+        return zeros(T, M, N)
+    end
+    S_trunc = zeros(eltype(S), length(S))
+    for i in 1:min(R, length(S))
+        S_trunc[i] = S[i]
+    end
+    return U * Diagonal(S_trunc) * V'
+end
+
+# Funkcija, ki implementira HLR aproksimacijo z adaptivnim izborom ranga za zmanjševanje seizmičnega šuma.
+function hlr_denoise(d::Vector{T}, Nite::Int, λ::Real) where T
+    # Ustvarimo Hankelovo matriko D iz vhodnega šumnega signala d.
+    D = hankel_matrix(d)
+    # Inicializiramo L0 kot adaptivno nizkorang aproksimacijo od D.
+    L = adaptive_proj_low_rank(D)
+    H_mat = similar(D)
+    for k in 1:Nite
+        # Posodobitev: H_{k+1} = 1/(1+λ) * P_H(D + λ * L)
+        H_mat = proj_hankel(D .+ λ * L)
+        H_mat .= (1 / (1 + λ)) .* H_mat
+        # Posodobitev: L_{k+1} = adaptivna projekcija H_mat na matrike z nizkim rangom
+        L = adaptive_proj_low_rank(H_mat)
+    end
+    # Končni ocenjeni signal pridobimo s pomočjo inverz Hankelove transformacije.
+    s_est = inv_hankel(H_mat)
+    return s_est
+end
+
+# Funkcija za izračun SNR, kjer so:
+# clean - čisti signal, denoised - očiščen signal
+function compute_snr(clean::Vector{T}, denoised::Vector{T}) where T
+    snr = 10 * log10(norm(clean)^2 / norm(clean - denoised)^2)
+    return snr
+end
+
+# ------------------ Podatki (isti primer kot prej) ------------------
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+λ = 27                    # fiksiran penalty parameter
+nite_grid = 1:1:100       # testiramo število iteracij od 1 do 100
+
+# (Neobvezno) Utišaj izpis "Uporabljen rank: ..." z redirect_stdout:
+denoise_quiet(x, Nite, λ) = redirect_stdout(devnull) do
+    hlr_denoise(x, Nite, λ)
+end
+
+# ------------------ Preizkus Nite in meritev SNR ------------------
+snrs = zeros(Float64, length(nite_grid))
+denoised_per_iter = Vector{Vector{Float64}}(undef, length(nite_grid))
+
+for (idx, N) in enumerate(nite_grid)
+    den = denoise_quiet(noisy_signal, N, λ)
+    denoised_per_iter[idx] = den
+    snrs[idx] = compute_snr(clean_signal, den)
+end
+
+best_idx = argmax(snrs)
+best_N = nite_grid[best_idx]
+best_snr = snrs[best_idx]
+best_denoised = denoised_per_iter[best_idx]
+
+@info @sprintf("Najboljši N = %d, SNR = %.2f dB (λ=%d)", best_N, best_snr, λ)
+
+# ------------------ Lep prikaz ------------------
+default(fontfamily="Computer Modern", titlefont=14, guidefont=12, tickfont=10, legendfont=10)
+
+# 1) SNR(N)
+p1 = plot(nite_grid, snrs;
+    xlabel = "Število iteracij N",
+    ylabel = "SNR [dB]",
+    title  = "HLR: SNR glede na število iteracij (λ = 27)",
+    lw = 2, markershape = :circle, markerstrokewidth = 0,
+    legend = false, framestyle = :box)
+
+scatter!(p1, [best_N], [best_snr], markershape=:star5, ms=8, label=false)
+annotate!(p1, best_N, best_snr,
+          text(@sprintf(" max @ N=%d (%.2f dB)", best_N, best_snr), 10, :left))
+
+# 2) Signali: čist, šumen, najboljši očiščen
+p2 = plot(t, clean_signal; lw=2, label="Čisti signal")
+plot!(p2, t, noisy_signal; lw=2, ls=:dash, label="Šumni signal")
+plot!(p2, t, best_denoised; lw=2, ls=:dot, label=@sprintf("Očiščen (N=%d)", best_N))
+xlabel!(p2, "Čas")
+ylabel!(p2, "Amplituda")
+title!(p2, @sprintf("Najboljši rezultat: N=%d, SNR=%.2f dB (λ=27)", best_N, best_snr))
+plot!(p2; framestyle=:box)
+
+plt = plot(p1, p2; layout=(2,1), size=(900,700))
+savefig(plt, "hlr_results02.pdf")   # saves in the current working directory

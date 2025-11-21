@@ -1,0 +1,148 @@
+using LinearAlgebra, Statistics, Random, Plots
+
+# ---------------- Hankel pripomočki ----------------
+
+# Hankel iz 1D vektorja
+function hankel_matrix(d::AbstractVector{T}) where {T<:Real}
+    L = length(d)
+    M = floor(Int, L ÷ 2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M, j in 1:N
+        H[i, j] = d[i + j - 1]
+    end
+    return H
+end
+
+# Inverzni Hankel: povprečenje antidiagonal
+function inv_hankel(H::AbstractMatrix{T}) where {T<:Real}
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    cnt = zeros(Int, L)
+    @inbounds for i in 1:M, j in 1:N
+        k = i + j - 1
+        d_est[k] += H[i, j]
+        cnt[k] += 1
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= cnt[k]
+    end
+    return d_est
+end
+
+# ------------- MSSA / LR (TSVD) denoiser --------------
+
+"""
+    mssa_denoise(d, R; adaptive=true)
+
+Osnovni MSSA (LR/TSVD) za 1D: hankelizacija → SVD → ohranimo prvih R (ali adaptivno)
+→ dehankelizacija. Vrne (očiščeni_signal, uporabljen_R).
+"""
+function mssa_denoise(d::AbstractVector{T}, R::Int; adaptive::Bool=true) where {T<:Real}
+    D = hankel_matrix(d)
+    M, N = size(D)
+
+    F = svd(D; full=false)
+    U, s, Vt = F.U, F.S, F.Vt
+
+    R_used = if adaptive
+        ratio = M / N
+        c = 0.56*ratio^3 - 0.95*ratio^2 + 1.82*ratio + 1.43
+        σ_med = median(s)
+        max(count(≥(c*σ_med), s), 1)
+    else
+        R
+    end
+    R_used = clamp(R_used, 1, length(s))
+
+    D_denoised = U[:, 1:R_used] * Diagonal(s[1:R_used]) * Vt[1:R_used, :]
+    d_est = inv_hankel(D_denoised)
+    return d_est, R_used
+end
+
+# ------------- Metrika -------------
+compute_snr(C::AbstractVector, A::AbstractVector) =
+    10 * log10(norm(C)^2 / norm(C .- A)^2)
+
+# ------------- Iterativni LR (6 iteracij) -------------
+
+lr_once(d::AbstractVector, R::Int; adaptive::Bool=true) =
+    mssa_denoise(d, R; adaptive=adaptive)
+
+function lr_denoise_iter(
+    d_obs::AbstractVector, R0::Int;
+    niter::Int=6, adaptive::Bool=true,
+    clean_ref::Union{Nothing,AbstractVector}=nothing,
+    verbose::Bool=true
+)
+    d = copy(d_obs)
+    snr_hist = Float64[]
+    r_used_hist = Int[]
+    for it in 1:niter
+        d, R_used = lr_once(d, R0; adaptive=adaptive)
+        push!(r_used_hist, R_used)
+        if clean_ref !== nothing
+            snr = 10*log10(norm(clean_ref)^2 / norm(clean_ref .- d)^2)
+            push!(snr_hist, snr)
+            verbose && println("Iteracija $it: R_used = $R_used, SNR = $(round(snr, digits=3)) dB")
+        elseif verbose
+            println("Iteracija $it: R_used = $R_used")
+        end
+    end
+    return d, snr_hist, r_used_hist
+end
+
+# ----------------- Sintetični testni primer -----------------
+
+# Čisti signal (vsota harmonikov)
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+
+# Šum (σ=0.4)
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Parametri
+R0 = 0          # začetni R (ignorira se, če adaptive=true)
+niter = 6
+
+# En prehod (za primerjavo)
+den_once, R_used_once = lr_once(noisy_signal, R0; adaptive=true)
+snr_once = compute_snr(clean_signal, den_once)
+println("LR en prehod: R_used = $R_used_once, SNR = $(round(snr_once, digits=3)) dB")
+
+# 6 iteracij LR (MSSA)
+den_iter, snr_hist, r_used_hist = lr_denoise_iter(
+    noisy_signal, R0; niter=niter, adaptive=true, clean_ref=clean_signal, verbose=true)
+
+best_it  = isempty(snr_hist) ? 0 : argmax(snr_hist)
+best_snr = isempty(snr_hist) ? NaN : snr_hist[best_it]
+println("Najboljši SNR = $(round(best_snr, digits=3)) dB pri iteraciji $best_it")
+println("R_used po iteracijah: ", r_used_hist)
+
+# ----------------- Figura: SNR + sledi (PDF) -----------------
+
+# Zgoraj: SNR po iteracijah
+p_top = plot(1:length(snr_hist), snr_hist; marker=:circle, lw=2, label="SNR",
+             xlabel="Iteracija", ylabel="SNR (dB)",
+             title="Napredek SNR – LR (MSSA) razšumljanje")
+if !isempty(snr_hist)
+    vline!(p_top, [best_it]; ls=:dash, lc=:red, label="Najboljša iteracija = $best_it")
+    annotate!(p_top, (best_it, best_snr), text("max $(round(best_snr, digits=3)) dB", 8, :left))
+end
+
+# Spodaj: časovni poteki
+p_bot = plot(t, clean_signal; label="Čisti", lw=2)
+plot!(p_bot, t, noisy_signal;  label="Šumni", lw=2, ls=:dash)
+plot!(p_bot, t, den_once;      label="LR en prehod", lw=2, ls=:dot)
+plot!(p_bot, t, den_iter;      label="LR iterativno ($niter)", lw=2, ls=:dashdot)
+xlabel!(p_bot, "Čas"); ylabel!(p_bot, "Amplituda")
+title!(p_bot, "LR: razšumljanje (brez rekonstrukcije)")
+
+# Združeno in shranjeno v PDF (za LaTeX/Overleaf)
+fig = plot(p_top, p_bot; layout=(2,1), size=(900,900))
+savefig(fig, "lr_1d_combined02.pdf")
+display(fig)
+println("Shranjeno: lr_1d_combined02.pdf")

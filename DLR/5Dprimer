@@ -1,0 +1,494 @@
+# Damped Rank-Reduction (DLR) za 5-D seizmične podatke v Julii
+# -----------------------------------------------------------------------------
+# Reprodukcija algoritma iz:
+#   Yangkang Chen et al., "Simultaneous denoising and reconstruction of 5-D
+#   seismic data via damped rank-reduction method", Geophys. J. Int. (2016)
+#   206, 1695–1717. DOI: 10.1093/gji/ggw230
+#
+# Kaj počne ta skripta
+# --------------------
+# 1) Zgradi preprost 5-D sintetični volumen z nekaj ravninskimi dogodki
+#    (čas, hx, hy, x, y).
+# 2) Doda pasovno omejen naključni šum in naključno odstrani sledi (maska).
+# 3) Izvede uteženo POCS-podobno rekonstrukcijo z:
+#      (a) tradicionalno TSVD redukcijo ranga (MSSA / Cadzow) ali
+#      (b) predlagano dušeno TSVD (DLR) z dušilnim faktorjem N.
+# 4) Izračuna metrike (SNR) in shrani več slik kot PDF (z večjo levo maržo).
+#
+# OPOMBE
+# ------
+# • Implementacija je pisana za jasnost in zvestobo članku (ne za maksimum hitrosti).
+# • Hankelizacija je eksplicitna z indeksi, da lahko natančno zlagamo antidiagonale.
+# • Uporabimo navaden SVD iz LinearAlgebra (za večje teste lahko zamenjate z RSVD).
+# • Slike se shranijo v trenutni direktorij kot PDF.
+#
+# Uporaba
+# -------
+#   julia --project -e 'using Pkg; Pkg.instantiate(); include("dlr_5d_damped_rank_reduction.jl"); main()'
+#
+# Ali iz REPL:
+#   include("dlr_5d_damped_rank_reduction.jl"); main()
+#
+# Avtor: ChatGPT (Julia implementacija)
+# -----------------------------------------------------------------------------
+
+using LinearAlgebra
+using FFTW
+using Random
+using Statistics
+using Printf
+
+# ---------------------------- Risanje / Plots ---------------------------------
+try
+    @eval begin
+        using Plots
+        using Measures                # mm enote za marže
+        gr()                          # GR backend – zanesljiv za PDF
+        # večja leva marža, da se oznake ne odrežejo; nekoliko večja slika
+        default(size=(1100,750),
+                left_margin=8mm, right_margin=8mm, top_margin=8mm, bottom_margin=10mm,
+                guidefont=font(11), tickfont=font(9), legendfont=font(10), titlefont=font(12))
+    end
+catch
+    @warn "Plots.jl/Measures.jl ni na voljo. Slike bodo izpuščene."
+end
+
+# --------------------------- Pomožne funkcije ---------------------------------
+
+"""
+    ricker(t, f0; t0=0.0)
+
+Rickerjev valček s konično frekvenco `f0` (Hz) ob času `t0` (s).
+"""
+function ricker(t, f0; t0=0.0)
+    τ = t .- t0
+    pf = (pi * f0 .* τ)
+    return (1 .- 2 .* pf.^2) .* exp.(-pf.^2)
+end
+
+"""
+    add_event!(D, dt; f0=30.0, t0, slope, weights, amp)
+
+Doda ravninski dogodek z Rickerjevim valčkom v 5-D kocko `D` (nt,nhx,nhy,nx,ny).
+Čas prihoda: `t0 + slope⋅(α1*hx + α2*hy + α3*x + α4*y)`; uteži prek `weights`.
+"""
+function add_event!(D::Array{Float64,5}, dt; f0=28.0, t0=0.1, slope=0.004,
+                    weights=(0.7, -0.6, 0.8, -0.5), amp=1.0)
+    nt, nhx, nhy, nx, ny = size(D)
+    t = collect(0.0:dt:(nt-1)*dt)
+    for j1 in 1:nhx, j2 in 1:nhy, j3 in 1:nx, j4 in 1:ny
+        τ = t0 + slope*(weights[1]*(j1-1) + weights[2]*(j2-1) +
+                        weights[3]*(j3-1) + weights[4]*(j4-1))
+        D[:, j1, j2, j3, j4] .+= amp .* ricker(t, f0; t0=τ)
+    end
+    return D
+end
+
+"""
+    build_synthetic(; nt=400, dt=0.004, nhx=11, nhy=11, nx=11, ny=11)
+
+Zgradi sintetični 5-D volumen s tremi križajočimi se ravninskimi dogodki.
+"""
+function build_synthetic(; nt=400, dt=0.004, nhx=11, nhy=11, nx=11, ny=11)
+    D = zeros(Float64, nt, nhx, nhy, nx, ny)
+    add_event!(D, dt; f0=26.0, t0=0.08,  slope= 0.0035, weights=( 0.8,  0.1, -0.6,  0.3), amp=0.9)
+    add_event!(D, dt; f0=32.0, t0=0.18, slope=-0.0025, weights=(-0.4,  0.7,  0.4, -0.5), amp=1.0)
+    add_event!(D, dt; f0=22.0, t0=0.28, slope= 0.0018, weights=( 0.3, -0.6,  0.5,  0.6), amp=0.8)
+    return D
+end
+
+"""
+    bandlimited_noise(sz, dt; var=0.25, fpass=(8.0,45.0))
+
+Ustvari pasovno omejen naključni šum s približno varianco `var`.
+"""
+function bandlimited_noise(sz::NTuple{5,Int}, dt; var=0.25, fpass=(8.0, 45.0))
+    nt, nhx, nhy, nx, ny = sz
+    n = randn(nt, nhx, nhy, nx, ny)              # beli šum
+    Nw = div(nt,2) + 1
+    df = 1.0/(nt*dt)
+    f = (0:Nw-1) .* df
+    keep = (f .>= fpass[1]) .& (f .<= fpass[2])
+    NF = rfft(n, 1)                               # FFT po času
+    for k in 1:Nw
+        if !keep[k]; NF[k, :, :, :, :] .= 0.0; end
+    end
+    nb = irfft(NF, nt, 1)
+    sc = sqrt(var) / std(vec(nb))                 # normiraj na var
+    nb .*= sc
+    return nb
+end
+
+"""
+    mask_random(sz; sampling_ratio=0.3, seed=0)
+
+Ustvari Bool masko z `true` tam, kjer so podatki ohranjeni. Manjkajo cele sledi.
+"""
+function mask_random(sz::NTuple{5,Int}; sampling_ratio=0.3, seed=0)
+    nt, nhx, nhy, nx, ny = sz
+    rng = MersenneTwister(seed)
+    mask_traces = rand(rng, nhx, nhy, nx, ny) .< sampling_ratio
+    mask = repeat(reshape(mask_traces, 1, nhx, nhy, nx, ny), nt)
+    return mask .> 0
+end
+
+# -------------------- Hankelizacija (blok 4. stopnje) --------------------------
+
+struct HankelMap
+    X::NTuple{4,Int}    # (X1..X4)
+    Y::NTuple{4,Int}    # (Y1..Y4)
+    C::NTuple{4,Int}    # (C1..C4) z Ci = Xi-Yi+1
+    rows::Int           # ∏Y
+    cols::Int           # ∏C
+    idxD::Vector{Int}   # dolžine rows*cols, linearni indeksi v vec(D4)
+end
+
+"""
+    build_hankel_map(X1, X2, X3, X4)
+
+Zgradi indeksno preslikavo iz vnosov blokovne Hankelove matrike nazaj v `D4`.
+"""
+function build_hankel_map(X1::Int, X2::Int, X3::Int, X4::Int)
+    Y1, Y2, Y3, Y4 = (fld(X1,2)+1, fld(X2,2)+1, fld(X3,2)+1, fld(X4,2)+1)
+    C1, C2, C3, C4 = (X1-Y1+1, X2-Y2+1, X3-Y3+1, X4-Y4+1)
+    rows = Y1*Y2*Y3*Y4
+    cols = C1*C2*C3*C4
+    idxD = Vector{Int}(undef, rows*cols)
+
+    # linearni indeks v Juliji (stolpčno razvrščanje)
+    mul = (1, X1, X1*X2, X1*X2*X3)
+
+    p = 1
+    for col in 0:(cols-1)
+        c1 = (col % C1) + 1
+        c2 = ((div(col, C1)) % C2) + 1
+        c3 = ((div(col, C1*C2)) % C3) + 1
+        c4 = ((div(col, C1*C2*C3)) % C4) + 1
+        for row in 0:(rows-1)
+            r1 = (row % Y1) + 1
+            r2 = ((div(row, Y1)) % Y2) + 1
+            r3 = ((div(row, Y1*Y2)) % Y3) + 1
+            r4 = ((div(row, Y1*Y2*Y3)) % Y4) + 1
+            k1 = r1 + c1 - 1
+            k2 = r2 + c2 - 1
+            k3 = r3 + c3 - 1
+            k4 = r4 + c4 - 1
+            idxD[p] = k1*mul[1] + (k2-1)*mul[2] + (k3-1)*mul[3] + (k4-1)*mul[4]
+            p += 1
+        end
+    end
+    return HankelMap((X1,X2,X3,X4), (Y1,Y2,Y3,Y4), (C1,C2,C3,C4), rows, cols, idxD)
+end
+
+"""
+    hankelize(D4, Hmap) -> M
+
+Hankelizacija 4-D polja `D4`. Vrne matriko `M` velikosti (∏Y)×(∏C).
+"""
+function hankelize(D4::AbstractArray{ComplexF64,4}, Hmap::HankelMap)
+    M = Matrix{ComplexF64}(undef, Hmap.rows, Hmap.cols)
+    dvec = vec(D4)
+    @inbounds for j in 1:length(Hmap.idxD)
+        M[j] = dvec[Hmap.idxD[j]]
+    end
+    return M
+end
+
+"""
+    dehankelize(M, Hmap) -> D4_est
+
+Zlaganje nazaj v 4-D hiper-kocko (povprečenje po antidiagonalah).
+"""
+function dehankelize(M::AbstractMatrix{ComplexF64}, Hmap::HankelMap)
+    X1, X2, X3, X4 = Hmap.X
+    acc = zeros(ComplexF64, X1, X2, X3, X4)
+    cnt = zeros(Int, X1, X2, X3, X4)
+    mvec = vec(M)
+    @inbounds for j in 1:length(Hmap.idxD)
+        idx = Hmap.idxD[j]
+        acc[idx] += mvec[j]
+        cnt[idx] += 1
+    end
+    D4 = Array{ComplexF64,4}(undef, X1, X2, X3, X4)
+    @inbounds for i in eachindex(acc)
+        D4[i] = cnt[i] == 0 ? 0 : acc[i]/cnt[i]
+    end
+    return D4
+end
+
+# ---------------------- TSVD in dušena TSVD -----------------------------------
+
+"""
+    tsvd_reduction(M, K)
+
+Tradicionalna TSVD redukcija ranga: obdrži top-K singularnih parov.
+"""
+function tsvd_reduction(M::AbstractMatrix{ComplexF64}, K::Int)
+    F = svd(M)
+    K = min(K, length(F.S))
+    U = F.U[:, 1:K]
+    V = F.Vt[1:K, :]
+    S = Diagonal(F.S[1:K])
+    return U * S * V
+end
+
+"""
+    damped_tsvd(M, K, N)
+
+Dušena TSVD po enačbah (12)–(15) v članku. Faktor dušenja `N ≥ 1`.
+"""
+function damped_tsvd(M::AbstractMatrix{ComplexF64}, K::Int, N::Int)
+    F = svd(M)
+    s = F.S
+    K = min(K, length(s))
+    U = F.U[:, 1:K]
+    V = F.Vt[1:K, :]
+    σ1 = s[1:K]
+    δhat = (K < length(s)) ? s[K+1] : 0.0
+    if δhat == 0.0 || N <= 0
+        Sd = Diagonal(σ1)
+    else
+        fac = @. (1.0 - (δhat/σ1)^N)   # σ_i * (1 - (δ/σ_i)^N)
+        Sd = Diagonal(σ1 .* fac)
+    end
+    return U * Sd * V
+end
+
+# --------------------- Filter na frekvenčnem rezu ------------------------------
+
+"""
+    filter_slice(D4, Hmap; K=3, damped=false, N=3)
+
+Uporabi MSSA (TSVD) ali DLR (dušena TSVD) na enem frekvenčnem rezu `D4`.
+"""
+function filter_slice(D4::AbstractArray{ComplexF64,4}, Hmap::HankelMap; K=3, damped=false, N=3)
+    M = hankelize(D4, Hmap)
+    M̃ = damped ? damped_tsvd(M, K, N) : tsvd_reduction(M, K)
+    return dehankelize(M̃, Hmap)
+end
+
+# --------------------- Utežena POCS-podobna iteracija -------------------------
+
+"""
+    reconstruct(DobsF, mask; K=3, N=3, niter=10, eps=1e-7, damped=false)
+
+Izvede iteracijo (16) v frekvenčni domeni in vrne rekonstruiran volumen.
+"""
+function reconstruct(DobsF::Array{ComplexF64,5}, mask::BitArray{5};
+                     K=3, N=3, niter=10, eps=1e-7, damped=false)
+    Nw, nhx, nhy, nx, ny = size(DobsF)
+    Hmap = build_hankel_map(nhx, nhy, nx, ny)
+
+    Dn = copy(DobsF)
+    an = range(1.0, 0.0; length=niter)
+
+    for it = 1:niter
+        @info(@sprintf("Iteracija %d / %d", it, niter))
+        for w in 1:Nw
+            D4 = @view Dn[w, :, :, :, :]
+            D4f = filter_slice(D4, Hmap; K=K, damped=damped, N=N)
+            @. D4 = an[it] * DobsF[w, :, :, :, :] + (1 - an[it] * mask[w, :, :, :, :]) * D4f
+        end
+        if it > 1 && norm(Dn - DobsF) < eps
+            break
+        end
+    end
+    return Dn
+end
+
+# --------------------------- Metri ke & pomočniki ------------------------------
+
+"""
+    snr_db(clean, estimate)
+
+SNR v dB (enačba 17).
+"""
+function snr_db(clean::AbstractArray, estimate::AbstractArray)
+    s = vec(clean); ŝ = vec(estimate)
+    return 10*log10(sum(abs2, s) / sum(abs2, s .- ŝ))
+end
+
+"""
+    tofreq(D, dt) -> (F, Nw)
+
+rFFT po času (dimenzija 1).
+"""
+function tofreq(D::Array{Float64,5}, dt)
+    F = rfft(D, 1)
+    return F, size(F,1)
+end
+
+"""
+    totime(F, nt)
+
+iFFT nazaj v časovno domeno.
+"""
+function totime(F::Array{ComplexF64,5}, nt::Int)
+    return irfft(F, nt, 1)
+end
+
+# ------------------ Eksperiment (sintetični primer #1) ------------------------
+
+function experiment_synthetic_1(; nt=400, dt=0.004, nhx=11, nhy=11, nx=11, ny=11,
+                                 noise_var=0.25, sampling_ratio=0.3,
+                                 K=3, N=3, niter=10, seed=42,
+                                 do_plots=true)
+    # Čisto + šum + manjkajoče
+    Dclean = build_synthetic(nt=nt, dt=dt, nhx=nhx, nhy=nhy, nx=nx, ny=ny)
+    Nn = bandlimited_noise(size(Dclean), dt; var=noise_var)
+    Dnoisy = Dclean .+ Nn
+    mask = mask_random(size(Dclean); sampling_ratio=sampling_ratio, seed=seed)
+    Dobs = Dnoisy .* mask
+
+    # FFT po času
+    Fobs, Nw = tofreq(Dobs, dt)
+
+    # Maska v frekvenčni domeni (enaka preko frekvenc)
+    Fmask = falses(size(Fobs))
+    for w in 1:Nw
+        Fmask[w, :, :, :, :] .= mask[w, :, :, :, :]
+    end
+
+    # --- Tradicionalni MSSA (TSVD)
+    Ftrad = reconstruct(Fobs, Fmask; K=K, N=N, niter=niter, damped=false)
+    Dtrad = totime(Ftrad, nt)
+
+    # --- Predlagani DLR (dušena TSVD)
+    Fprop = reconstruct(Fobs, Fmask; K=K, N=N, niter=niter, damped=true)
+    Dprop = totime(Fprop, nt)
+
+    # Metrike
+    snr_obs  = snr_db(Dclean, Dobs)
+    snr_trad = snr_db(Dclean, Dtrad)
+    snr_prop = snr_db(Dclean, Dprop)
+    @info(@sprintf("SNR (dB): Opazovano=%6.2f  Tradicionalno=%6.2f  Predlagano=%6.2f",
+                   snr_obs, snr_trad, snr_prop))
+
+    if @isdefined(Plots) && do_plots
+        # CMP (x=6, y=6) in CO (hx=6, hy=6) – ISTA ORIENTACIJA KOT V KODI 1
+        x0, y0 = 6, 6
+        hx0, hy0 = 6, 6
+
+        # helperja kot v prvotni kodi: vrneta 2-D matriko za heatmap(Z)
+        # CO: čas×x -> permutirano v (x × čas)
+        slice_co2d(A)  = permutedims(@view(A[:, hx0, hy0, :, y0]), (2,1))
+        # CMP: čas×hx -> permutirano v (hx × čas)
+        slice_cmp2d(A) = permutedims(@view(A[:, :, hy0, x0, y0]), (2,1))
+
+        # --- CO pregled (isti look kot prej: vertikalne “črte”)
+        p1 = plot(layout=(2,3))
+        heatmap!(p1[1,1], slice_co2d(Dclean), title="Čisti",     xlabel="X",  ylabel="Čas (s)")
+        heatmap!(p1[1,2], slice_co2d(Dnoisy), title="Z šumom",    xlabel="X",  ylabel="Čas (s)")
+        heatmap!(p1[1,3], slice_co2d(Dobs),   title="Opazovani", xlabel="X",  ylabel="Čas (s)")
+        heatmap!(p1[2,1], slice_co2d(Dtrad),  title="Tradicionalna", xlabel="X", ylabel="Čas (s)")
+        heatmap!(p1[2,2], slice_co2d(Dprop),  title="Predlagana",    xlabel="X", ylabel="Čas (s)")
+        plot!(p1[2,3], framestyle=:none)
+        savefig(p1, "01_CO_pregled.pdf")
+        display(p1)
+
+        # --- CMP pregled (isti look kot prej)
+        p2 = plot(layout=(2,3))
+        heatmap!(p2[1,1], slice_cmp2d(Dclean), title="Čisti",     xlabel="HX", ylabel="Čas (s)")
+        heatmap!(p2[1,2], slice_cmp2d(Dnoisy), title="Z šumom",    xlabel="HX", ylabel="Čas (s)")
+        heatmap!(p2[1,3], slice_cmp2d(Dobs),   title="Opazovani",  xlabel="HX", ylabel="Čas (s)")
+        heatmap!(p2[2,1], slice_cmp2d(Dtrad),  title="Tradicionalna", xlabel="HX", ylabel="Čas (s)")
+        heatmap!(p2[2,2], slice_cmp2d(Dprop),  title="Predlagana",    xlabel="HX", ylabel="Čas (s)")
+        plot!(p2[2,3], framestyle=:none)
+        savefig(p2, "02_CMP_pregled.pdf")
+        display(p2)
+
+        # --- Srednja sled (primerjava amplitud)
+        t = collect(0.0:dt:(nt-1)*dt)
+        trc = x0; cly = y0; midhx = Int(ceil(nhx/2)); midhy = Int(ceil(nhy/2))
+        clean_tr = Dclean[:, midhx, midhy, trc, cly]
+        noisy_tr = Dnoisy[:, midhx, midhy, trc, cly]
+        trad_tr  = Dtrad[:,  midhx, midhy, trc, cly]
+        prop_tr  = Dprop[:,  midhx, midhy, trc, cly]
+        p3 = plot(t, clean_tr, lw=2, label="Čisti", xlabel="Čas (s)", ylabel="Amplituda")
+        plot!(p3, t, noisy_tr, lw=1, label="Z šumom")
+        plot!(p3, t, trad_tr,  lw=2, label="Tradicionalna")
+        plot!(p3, t, prop_tr,  lw=2, label="Predlagana")
+        savefig(p3, "03_Srednja_sled.pdf")
+        display(p3)
+
+        # --- Hankelova matrika pri ~26 Hz
+        Nw = div(nt,2)+1; df = 1.0/(nt*dt); f = (0:Nw-1).*df
+        k26 = argmin(abs.(f .- 26.0))
+        Hmap = build_hankel_map(nhx, nhy, nx, ny)
+        Mc = hankelize(@view(tofreq(Dclean, dt)[1][k26, :, :, :, :]), Hmap)
+        Mo = hankelize(@view(Fobs[k26, :, :, :, :]), Hmap)
+        Mt = hankelize(@view(Ftrad[k26, :, :, :, :]), Hmap)
+        Mp = hankelize(@view(Fprop[k26, :, :, :, :]), Hmap)
+        p4 = plot(layout=(2,2))
+        heatmap!(p4[1,1], real(Mc), title="Hankelova (čisti) pri ~26 Hz", xlabel="Stolpci", ylabel="Vrstice")
+        heatmap!(p4[1,2], real(Mo), title="Hankelova (opazovani)",        xlabel="Stolpci", ylabel="Vrstice")
+        heatmap!(p4[2,1], real(Mt), title="Hankelova (tradicionalna, 10 iteracij)", xlabel="Stolpci", ylabel="Vrstice")
+        heatmap!(p4[2,2], real(Mp), title="Hankelova (predlagana, 10 iteracij)",    xlabel="Stolpci", ylabel="Vrstice")
+        savefig(p4, "04_Hankel_26Hz.pdf")
+        display(p4)
+    end
+
+    return (; Dclean, Dnoisy, Dobs, Dtrad, Dprop, mask, K, N, niter)
+end
+
+# -------------------------- Pregleda (sweeps) ----------------------------------
+
+function sweep_noise_levels(; noise_vars=[0.05, 0.10, 0.25, 0.50, 0.75, 1.0],
+                             sampling_ratio=0.3, K=3, N=3, niter=10)
+    snr_trad = Float64[]
+    snr_prop = Float64[]
+    for σ2 in noise_vars
+        R = experiment_synthetic_1(noise_var=σ2, sampling_ratio=sampling_ratio,
+                                   K=K, N=N, niter=niter, do_plots=false)
+        push!(snr_trad, snr_db(R.Dclean, R.Dtrad))
+        push!(snr_prop, snr_db(R.Dclean, R.Dprop))
+    end
+    if @isdefined(Plots)
+        p = plot(noise_vars, snr_trad, lw=2, marker=:o, label="Tradicionalna",
+                 xlabel="Varianca šuma", ylabel="SNR (dB)")
+        plot!(p, noise_vars, snr_prop, lw=2, marker=:square, label="Predlagana")
+        savefig(p, "11_SNR_vs_varianca_suma.pdf")
+        display(p)
+    end
+    return snr_trad, snr_prop
+end
+
+function sweep_sampling_ratios(; sampling_ratios=0.1:0.1:0.8, noise_var=0.25,
+                                K=3, N=3, niter=10)
+    snr_trad = Float64[]
+    snr_prop = Float64[]
+    for ρ in sampling_ratios
+        R = experiment_synthetic_1(noise_var=noise_var, sampling_ratio=ρ,
+                                   K=K, N=N, niter=niter, do_plots=false)
+        push!(snr_trad, snr_db(R.Dclean, R.Dtrad))
+        push!(snr_prop, snr_db(R.Dclean, R.Dprop))
+    end
+    if @isdefined(Plots)
+        xv = collect(sampling_ratios).*100
+        p = plot(xv, snr_trad, lw=2, marker=:o,
+                 xlabel="Delež vzorčenja (%)", ylabel="SNR (dB)",
+                 label="Tradicionalna")
+        plot!(p, xv, snr_prop, lw=2, marker=:square, label="Predlagana")
+        savefig(p, "12_SNR_vs_delez_vzorcenja.pdf")
+        display(p)
+    end
+    return snr_trad, snr_prop
+end
+
+# ---------------------------------- main() ------------------------------------
+
+function main()
+    @info "Zaganjam sintetični primer #1 (K=3, N=3, niter=10)"
+    _ = experiment_synthetic_1(K=3, N=3, niter=10)
+
+    @info "Pregled po ravneh šuma (analog Fig. 11)"
+    sweep_noise_levels()
+
+    @info "Pregled po deležu vzorčenja (analog Fig. 12)"
+    sweep_sampling_ratios()
+
+    println("\nKončano. PDF slike so shranjene v trenutnem direktoriju.")
+end
+
+# Za zagon ob vključitvi datoteke
+main()

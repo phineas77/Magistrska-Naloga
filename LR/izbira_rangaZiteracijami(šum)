@@ -1,0 +1,177 @@
+using LinearAlgebra, Statistics, Plots, Random
+
+# ======================================
+# Hankel helpers (1D)
+# ======================================
+
+# Sestavi Hankelovo matriko iz vektorja d.
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = floor(Int, L/2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M, j in 1:N
+        H[i, j] = d[i + j - 1]
+    end
+    return H
+end
+
+# Inverzni Hankelov operator: povpreči elemente vzdolž antidiagonale.
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M, j in 1:N
+        k = i + j - 1
+        d_est[k] += H[i, j]
+        counts[k] += 1
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# ======================================
+# MSSA denoising (z možnostjo adaptivnega izbora ranga)
+# ======================================
+# Če adaptive=true, se rang izračuna kot število singularnih vrednosti,
+# ki so ≥ c * median(s), c = 0.56*(M/N)^3 - 0.95*(M/N)^2 + 1.82*(M/N) + 1.43.
+function mssa_denoise(d::Vector{T}, R::Int; adaptive::Bool=true) where T
+    D = hankel_matrix(d)
+    M, N = size(D)
+
+    F = svd(D)
+    U, s, Vt = F.U, F.S, F.Vt
+
+    if adaptive
+        ratio = M / N
+        c = 0.56 * ratio^3 - 0.95 * ratio^2 + 1.82 * ratio + 1.43
+        sigma_med = median(s)
+        R_adapt = count(x -> x >= c * sigma_med, s)
+        R = max(R_adapt, 1)
+    else
+        R = max(R, 1)
+    end
+
+    # Rekonstrukcija z odrezanim SVD
+    r_used = min(R, length(s))
+    S_trunc = zeros(eltype(s), length(s))
+    @inbounds for i in 1:r_used
+        S_trunc[i] = s[i]
+    end
+    D_denoised = U * Diagonal(S_trunc) * Vt
+    d_est = inv_hankel(D_denoised)
+    return d_est, r_used
+end
+
+# ======================================
+# Iterativni OS11 slog (brez α-blendinga; čista iteracija F∘F∘…)
+# ======================================
+# Vrne: (zadnja_omejeitev, snr_hist [če podan clean_ref], r_hist z uporabljenimi rangi po iteracijah)
+function mssa_denoise_iter(
+    d_obs::Vector{T};
+    mmax::Int=6,
+    clean_ref::Union{Nothing,Vector{T}}=nothing,
+    R::Int=0,
+    adaptive::Bool=true
+) where T
+    d_m = copy(d_obs)
+    snr_hist = Float64[]
+    r_hist = Int[]
+    for m in 1:mmax
+        d_m, r_used = mssa_denoise(d_m, R; adaptive=adaptive)
+        push!(r_hist, r_used)
+        if clean_ref !== nothing
+            push!(snr_hist, 10 * log10(norm(clean_ref)^2 / norm(clean_ref - d_m)^2))
+        end
+    end
+    return d_m, snr_hist, r_hist
+end
+
+# ======================================
+# Merilo kakovosti
+# ======================================
+function compute_snr(C::Vector{T}, A::Vector{T}) where T
+    10 * log10(norm(C)^2 / norm(C - A)^2)
+end
+
+# ======================================
+# Demo / baseline
+# ======================================
+# Sintetičen čist signal
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+
+# Dodaj šum (baseline)
+rng = MersenneTwister(1234)
+clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+noisy_signal = clean_signal .+ noise
+
+# En prehod z adaptivnim rangom
+elapsed_time = @elapsed begin
+    denoised_signal, r_used = mssa_denoise(noisy_signal, 0; adaptive=true)
+    println("Uporabljen adaptivni rang (en prehod): ", r_used)
+end
+println("Čas izvajanja (en prehod): ", elapsed_time, " s")
+
+snr_value = compute_snr(clean_signal, denoised_signal)
+println("SNR po enem prehodu: ", round(snr_value, digits=3), " dB")
+
+# Vizualizacija baseline
+p1 = plot(t, clean_signal, label="Čisti signal", lw=2)
+plot!(p1, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p1, t, denoised_signal, label="Očiščen (MSSA, adapt.)", lw=2, ls=:dot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("MSSA z adaptivnim rangom – en prehod")
+display(p1)
+
+# ======================================
+# ITERATIVNO + IZPIS RANGOV ZA VSAK PRIMER ŠUMA (σ = 0.1 : 0.1 : 0.9)
+# ======================================
+noise_levels = 0.1:0.1:0.9
+mmax_iter = 6
+
+# Za pošteno primerjavo: ista smer šuma za vse σ
+rng2 = MersenneTwister(4321)
+noise_unit = randn(rng2, length(clean_signal))
+
+best_snr = Float64[]
+best_it  = Int[]
+best_r   = Int[]
+final_snr = Float64[]
+all_r_hist = Vector{Vector{Int}}(undef, length(noise_levels))
+
+println("\n==============================")
+println("Iterativni MSSA (adaptivni rang) po nivojih šuma")
+println("==============================")
+for (j, σ) in enumerate(noise_levels)
+    noisy = clean_signal .+ σ .* noise_unit
+    den_iter, snr_hist, r_hist = mssa_denoise_iter(noisy; mmax=mmax_iter, clean_ref=clean_signal, R=0, adaptive=true)
+    all_r_hist[j] = r_hist
+
+    # Najboljša in končna metrika
+    if isempty(snr_hist)
+        push!(best_snr, NaN); push!(best_it, 0); push!(best_r, 0); push!(final_snr, NaN)
+    else
+        it = argmax(snr_hist)
+        push!(best_it, it)
+        push!(best_snr, snr_hist[it])
+        push!(best_r, r_hist[it])
+        push!(final_snr, snr_hist[end])
+    end
+
+    println("σ = $(round(σ, digits=1)): rangi po iteracijah = $(r_hist) | ",
+            "najboljši SNR = $(round(best_snr[end], digits=3)) dB pri iteraciji $(best_it[end]) (R=$(best_r[end])) | ",
+            "končni SNR (iter $mmax_iter) = $(round(final_snr[end], digits=3)) dB")
+end
+
+# Vizualizacija: najboljši R in najboljši SNR skozi σ
+pR = plot(collect(noise_levels), best_r; lw=2, marker=:circle, label="R* (naj SNR)")
+xlabel!("σ šuma"); ylabel!("Najboljši rang R"); title!("Najboljši adaptivni R vs. σ (iterativni MSSA)")
+display(pR)
+
+pS = plot(collect(noise_levels), best_snr; lw=2, marker=:diamond, label="Najboljši SNR")
+plot!(pS, collect(noise_levels), final_snr; lw=2, marker=:utriangle, label="Končni SNR (zadnja iter.)")
+xlabel!("σ šuma"); ylabel!("SNR (dB)"); title!("SNR vs. σ – iterativni MSSA (adaptivni rang)")
+display(pS)

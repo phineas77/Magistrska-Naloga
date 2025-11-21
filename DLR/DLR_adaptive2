@@ -1,0 +1,200 @@
+using LinearAlgebra
+using Statistics
+using Random
+using Plots
+
+# --- Hankel helpers -----------------------------------------------------------
+
+# Build a Hankel matrix from a 1D vector
+function hankel_matrix(d::AbstractVector{T}) where {T<:Real}
+    L = length(d)
+    M = floor(Int, L/2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M, j in 1:N
+        H[i, j] = d[i + j - 1]
+    end
+    return H
+end
+
+# Inverse Hankel: average anti-diagonals back to a vector
+function inv_hankel(H::AbstractMatrix{T}) where {T<:Real}
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M, j in 1:N
+        k = i + j - 1
+        d_est[k] += H[i, j]
+        counts[k] += 1
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# --- Rank estimation (for reporting and/or adaptive use) ----------------------
+function estimate_rank(D::AbstractMatrix{T}) where {T<:Real}
+    M, N = size(D)
+    s = svdvals(D)
+    σ_med = median(s)
+    r = M/N
+    c = 0.56*r^3 - 0.95*r^2 + 1.82*r + 1.43
+    R_est = count(x -> x >= c * σ_med, s)
+    return max(R_est, 1)
+end
+
+# --- Damped TSVD --------------------------------------------------------------
+
+# Damped TSVD on top-K singular values
+function damped_tsvd(M::AbstractMatrix{T}, K::Int, damp::Real) where {T<:Real}
+    F = svd(M)                           # thin SVD
+    U, S, Vt = F.U, F.S, F.Vt
+    p = length(S)
+    K = clamp(K, 1, p)
+
+    S1 = view(S, 1:K)
+    S2 = K < p ? view(S, K+1:p) : similar(S, 0)
+
+    δ̂ = isempty(S2) ? zero(eltype(S)) : maximum(S2)
+    S1_safe = max.(S1, eps(eltype(S1)))
+
+    # T_damp = I - (δ̂^damp) * diag(S1.^(-damp)), clamped to [0,1]
+    t_vec = 1 .- (δ̂^damp) .* (S1_safe .^ (-damp))
+    t_vec = clamp.(t_vec, 0, 1)
+
+    U1  = @view U[:, 1:K]
+    V1t = @view Vt[1:K, :]
+    Σ1  = Diagonal(S1)
+    Td  = Diagonal(t_vec)
+
+    return U1 * (Σ1 * Td) * V1t
+end
+
+# One-shot damped rank reduction: Hankel → damped TSVD → inverse Hankel
+# (adaptive_rank=false by default; pass true to actually USE estimate_rank)
+function damped_rank_reduction_1d(d::AbstractVector{T}, K::Int, damp::Real; adaptive_rank::Bool=false) where {T<:Real}
+    D = hankel_matrix(d)
+    K_eff = adaptive_rank ? estimate_rank(D) : K
+    M_damped = damped_tsvd(D, K_eff, damp)
+    d_est = inv_hankel(M_damped)
+    return d_est
+end
+
+# --- ITERATIVNI DENOISER (BREZ REKONSTRUKCIJE) --------------------------------
+# Čista iteracija filtra: d_{m+1} = Fd(d_m).
+# Če podaš 'mask' (Bool vektor; true = opazovano), strogo brez rekonstrukcije:
+#   neopažovane vrnemo na original d_obs po vsakem filtru.
+# Funkcija VRAČA tudi:
+#   - snr_hist: SNR po iteracijah (če podan clean_ref)
+#   - rank_used_hist: rang, ki ga je algoritem UPORABIL v posamezni iteraciji
+#   - rank_est_hist: ocena ranga na podlagi trenutne Hankelove matrike (za vpogled)
+function dlr_denoise_iter(
+    d_obs::AbstractVector{T}, K::Int, damp::Real;
+    niter::Int=6,
+    adaptive_rank::Bool=false,
+    mask::Union{Nothing,AbstractVector{Bool}}=nothing,
+    clean_ref::Union{Nothing,AbstractVector}=nothing,
+    verbose::Bool=true
+) where {T<:Real}
+
+    d = copy(d_obs)
+    snr_hist = Float64[]
+    rank_used_hist = Int[]
+    rank_est_hist  = Int[]
+
+    for it in 1:niter
+        # oceni rang na trenutnem stanju (za poročanje/analizo)
+        R_est = estimate_rank(hankel_matrix(d))
+        push!(rank_est_hist, R_est)
+
+        # izberi rang, ki ga BOŠ uporab(l) (adaptiven ali fiksni)
+        K_eff = adaptive_rank ? R_est : K
+        push!(rank_used_hist, K_eff)
+
+        # filtriraj
+        d_filt = damped_rank_reduction_1d(d, K_eff, damp; adaptive_rank=false)
+
+        if mask === nothing
+            d .= d_filt                         # čisto odšumljanje
+        else
+            @assert length(mask) == length(d) "mask mora biti iste dolžine kot signal"
+            d .= d_filt
+            d[.!mask] .= d_obs[.!mask]         # strogo brez rekonstrukcije
+        end
+
+        if clean_ref !== nothing
+            push!(snr_hist, 10 * log10(norm(clean_ref)^2 / norm(clean_ref - d)^2))
+        end
+
+        if verbose
+            base_msg = "Iteracija $it: R_est = $R_est, R_used = $K_eff"
+            if clean_ref === nothing
+                println(base_msg)
+            else
+                println(base_msg * ", SNR = $(round(snr_hist[end], digits=3)) dB")
+            end
+        end
+    end
+
+    return d, snr_hist, rank_used_hist, rank_est_hist
+end
+
+# --- Metrični kazalnik --------------------------------------------------------
+function compute_snr(C::Vector{T}, A::Vector{T}) where {T<:Real}
+    10 * log10(norm(C)^2 / norm(C - A)^2)
+end
+
+# --- Demo / test --------------------------------------------------------------
+
+# Čisti signal
+t = 1:50
+clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+
+# Šum
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Parametri
+K    = 2       # fiksni rang (če adaptive_rank=false)
+damp = 2.0     # damping factor
+niter = 6
+
+# En prehod
+elapsed_once = @elapsed den_once = damped_rank_reduction_1d(noisy_signal, K, damp; adaptive_rank=false)
+snr_once = compute_snr(clean_signal, den_once)
+println("EN PREHOD: SNR = $(round(snr_once, digits=3)) dB, čas = $(round(elapsed_once, digits=4)) s")
+
+# Iterativno denoising (brez rekonstrukcije) + poročilo o rangih
+elapsed_iter = @elapsed den_iter, snr_hist, rank_used_hist, rank_est_hist =
+    dlr_denoise_iter(noisy_signal, K, damp;
+        niter=niter, adaptive_rank=true,  # nastavite true, če želite ADAPTIVNO UPORABITI R_est
+        mask=nothing, clean_ref=clean_signal, verbose=true)
+
+best_it = isempty(snr_hist) ? 0 : argmax(snr_hist)
+best_snr = isempty(snr_hist) ? NaN : snr_hist[best_it]
+println("ITERACIJE: najboljši SNR = $(round(best_snr, digits=3)) dB pri iteraciji $best_it; čas = $(round(elapsed_iter, digits=4)) s")
+println("R_est po iteracijah:  ", rank_est_hist)
+println("R_used po iteracijah: ", rank_used_hist)
+
+# Grafi
+p1 = plot(t, clean_signal, label="Čisti", lw=2)
+plot!(p1, t, noisy_signal,  label="Šumni", lw=2, ls=:dash)
+plot!(p1, t, den_once,      label="dMSSA en prehod", lw=2, ls=:dot)
+plot!(p1, t, den_iter,      label="dMSSA iterativno ($(niter))", lw=2, ls=:dashdot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("Združena predstavitev rezultata za 1D dMSSA razšumljanje")
+display(p1)
+
+p2 = plot(1:length(snr_hist), snr_hist, marker=:circle, lw=2, label="SNR")
+if !isempty(snr_hist)
+    vline!(p2, [best_it], ls=:dash, label="Najboljša iteracija = $best_it")
+    annotate!(p2, (best_it, best_snr), text("max $(round(best_snr, digits=2)) dB", 8, :left))
+end
+xlabel!("Iteracija"); ylabel!("SNR (dB)"); title!("Napredek SNR skozi iteracije – dMSSA razšumljanje")
+display(p2)
+
+fig = plot(p2, p1; layout=(2, 1), size=(900, 900))
+
+savefig(fig, "dlr_1d_combined.pdf")

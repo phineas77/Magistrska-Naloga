@@ -1,0 +1,520 @@
+# Damped Rank-Reduction (DLR) for 5‑D seismic data in Julia
+# -----------------------------------------------------------------------------
+# Reproduction of the algorithm described in:
+#   Yangkang Chen et al., "Simultaneous denoising and reconstruction of 5‑D
+#   seismic data via damped rank‑reduction method", Geophys. J. Int. (2016)
+#   206, 1695–1717. DOI: 10.1093/gji/ggw230
+#
+# What this script does
+# ---------------------
+# 1) Builds a simple 5‑D synthetic data volume with several plane‑wave events
+#    (time, hx, hy, x, y).
+# 2) Adds band‑limited random noise and randomly removes traces (mask).
+# 3) Runs the weighted POCS‑like reconstruction with either
+#      (a) Traditional TSVD rank‑reduction (MSSA / Cadzow), or
+#      (b) Proposed damped TSVD (DLR) with damping factor N.
+# 4) Computes quality metrics (SNR) and produces several figures similar to
+#    Figs. 1–12 in the paper (simplified 2‑D versions + a Hankel matrix view).
+#
+# NOTES
+# -----
+# • The implementation focuses on clarity and faithfulness to the paper, not on
+#   ultimate performance. Matrix sizes are kept modest so it will run on a
+#   laptop.
+# • The Hankelization is implemented explicitly using integer index maps so we
+#   can exactly perform the anti‑diagonal averaging (the adjoint folding step).
+# • RSVD is not required; plain SVD from LinearAlgebra is used. If you want to
+#   speed up large tests, replace `svd` with a probabilistic SVD package.
+# • Plots require the `Plots` package (GR backend by default).
+#
+# Usage
+# -----
+#   julia --project -e 'using Pkg; Pkg.instantiate(); include("dlr_5d_damped_rank_reduction.jl"); main()'
+#
+# Or from the REPL:
+#   include("dlr_5d_damped_rank_reduction.jl"); main()
+#
+# Author: ChatGPT (Julia implementation)
+# -----------------------------------------------------------------------------
+
+using LinearAlgebra
+using FFTW
+using Random
+using Statistics
+using Printf
+
+# Optional plotting
+try
+    @eval begin
+        using Plots
+        default(size=(900,600))
+    end
+catch
+    @warn "Plots.jl not available. Figures will be skipped. Run: using Pkg; Pkg.add(\"Plots\")."
+end
+
+# --------------------------- Utility functions --------------------------------
+
+"""
+    ricker(t, f0; t0=0.0)
+
+Ricker wavelet of peak frequency `f0` Hz at time `t0` seconds.
+"""
+function ricker(t, f0; t0=0.0)
+    τ = t .- t0
+    pf = (pi * f0 .* τ)
+    return (1 .- 2 .* pf.^2) .* exp.(-pf.^2)
+end
+
+"""
+    add_event!(D, t, dt, hx, hy, x, y; f0=30.0, t0, slope)
+
+Add a plane‑wave event with a Ricker wavelet onto the 5‑D cube `D` in place.
+`D` has size (nt, nhx, nhy, nx, ny).
+The arrival time is `t0 + slope⋅(α1*hx + α2*hy + α3*x + α4*y)`; choose
+`αi` via the keyword `weights = (α1,α2,α3,α4)`.
+Amplitude may be set with `amp`.
+"""
+function add_event!(D::Array{Float64,5}, dt; f0=28.0, t0=0.1, slope=0.004,
+                    weights=(0.7, -0.6, 0.8, -0.5), amp=1.0)
+    nt, nhx, nhy, nx, ny = size(D)
+    t = collect(0.0:dt:(nt-1)*dt)
+    for j1 in 1:nhx, j2 in 1:nhy, j3 in 1:nx, j4 in 1:ny
+        τ = t0 + slope*(weights[1]*(j1-1) + weights[2]*(j2-1) +
+                        weights[3]*(j3-1) + weights[4]*(j4-1))
+        D[:, j1, j2, j3, j4] .+= amp .* ricker(t, f0; t0=τ)
+    end
+    return D
+end
+
+"""
+    build_synthetic(; nt=400, dt=0.004, nhx=11, nhy=11, nx=11, ny=11)
+
+Create a synthetic 5‑D volume with three crossing plane‑wave events. Returns
+`Dclean` (Float64 array).
+"""
+function build_synthetic(; nt=400, dt=0.004, nhx=11, nhy=11, nx=11, ny=11)
+    D = zeros(Float64, nt, nhx, nhy, nx, ny)
+    # Three crossing events with different dips and frequencies
+    add_event!(D, dt; f0=26.0, t0=0.08,  slope= 0.0035, weights=( 0.8,  0.1, -0.6,  0.3), amp=0.9)
+    add_event!(D, dt; f0=32.0, t0=0.18, slope=-0.0025, weights=(-0.4,  0.7,  0.4, -0.5), amp=1.0)
+    add_event!(D, dt; f0=22.0, t0=0.28, slope= 0.0018, weights=( 0.3, -0.6,  0.5,  0.6), amp=0.8)
+    return D
+end
+
+"""
+    bandlimited_noise(size_tuple, dt; var=0.25, fpass=(8.0, 45.0))
+
+Generate band‑limited random noise with variance approximately `var`.
+"""
+function bandlimited_noise(sz::NTuple{5,Int}, dt; var=0.25, fpass=(8.0, 45.0))
+    nt, nhx, nhy, nx, ny = sz
+    # White noise in time domain
+    n = randn(nt, nhx, nhy, nx, ny)
+    # Band‑limit along time using FFT
+    Nw = div(nt,2) + 1
+    df = 1.0/(nt*dt)
+    f = (0:Nw-1) .* df
+    keep = (f .>= fpass[1]) .& (f .<= fpass[2])
+    NF = rfft(n, 1)
+    for k in 1:Nw
+        if !keep[k]
+            NF[k, :, :, :, :] .= 0.0
+        end
+    end
+    nb = irfft(NF, nt, 1)
+    # Normalize to requested variance
+    sc = sqrt(var) / std(vec(nb))
+    nb .*= sc
+    return nb
+end
+
+"""
+    mask_random(sz; sampling_ratio=0.3, seed=0)
+
+Create a Boolean mask with `true` where data is observed. Sampling ratio is
+fraction of traces kept (e.g., 0.3 keeps 30% of traces).
+Mask is constant across time (missing whole traces).
+"""
+function mask_random(sz::NTuple{5,Int}; sampling_ratio=0.3, seed=0)
+    nt, nhx, nhy, nx, ny = sz
+    rng = MersenneTwister(seed)
+    mask_traces = rand(rng, nhx, nhy, nx, ny) .< sampling_ratio
+    mask = repeat(reshape(mask_traces, 1, nhx, nhy, nx, ny), nt)
+    return mask .> 0
+end
+
+# -------------------- Hankelization (level‑4 block) ----------------------------
+
+struct HankelMap
+    X::NTuple{4,Int}    # (X1..X4)
+    Y::NTuple{4,Int}    # (Y1..Y4)
+    C::NTuple{4,Int}    # (C1..C4) with Ci = Xi-Yi+1
+    rows::Int           # ∏Y
+    cols::Int           # ∏C
+    idxD::Vector{Int}   # length rows*cols, linear indices into vec(D4)
+end
+
+"""
+    build_hankel_map(X1, X2, X3, X4)
+
+Precompute an index map from entries of the level‑4 block Hankel matrix to the
+original 4‑D spatial hypercube `D4` (per‑frequency slice). For each matrix entry
+(row, col) in M(4) we store the corresponding linear index in `vec(D4)`.
+"""
+function build_hankel_map(X1::Int, X2::Int, X3::Int, X4::Int)
+    Y1, Y2, Y3, Y4 = (fld(X1,2)+1, fld(X2,2)+1, fld(X3,2)+1, fld(X4,2)+1)
+    C1, C2, C3, C4 = (X1-Y1+1, X2-Y2+1, X3-Y3+1, X4-Y4+1)
+    rows = Y1*Y2*Y3*Y4
+    cols = C1*C2*C3*C4
+
+    idxD = Vector{Int}(undef, rows*cols)
+
+    # Precompute mixed‑radix multipliers for row/col unravel
+    # Row index -> (r1,r2,r3,r4)
+    Yrads = (1, Y1, Y1*Y2, Y1*Y2*Y3)
+    Crads = (1, C1, C1*C2, C1*C2*C3)
+
+    # multipliers for vec(D4) linear index in Julia (column‑major)
+    mul = (1, X1, X1*X2, X1*X2*X3)  # for (k1,k2,k3,k4)
+
+    p = 1
+    for col in 0:(cols-1)
+        c1 = (col % C1) + 1
+        c2 = ((div(col, C1)) % C2) + 1
+        c3 = ((div(col, C1*C2)) % C3) + 1
+        c4 = ((div(col, C1*C2*C3)) % C4) + 1
+        for row in 0:(rows-1)
+            r1 = (row % Y1) + 1
+            r2 = ((div(row, Y1)) % Y2) + 1
+            r3 = ((div(row, Y1*Y2)) % Y3) + 1
+            r4 = ((div(row, Y1*Y2*Y3)) % Y4) + 1
+            k1 = r1 + c1 - 1
+            k2 = r2 + c2 - 1
+            k3 = r3 + c3 - 1
+            k4 = r4 + c4 - 1
+            # linear index into vec(D4)
+            idxD[p] = k1*mul[1] + (k2-1)*mul[2] + (k3-1)*mul[3] + (k4-1)*mul[4]
+            p += 1
+        end
+    end
+
+    return HankelMap((X1,X2,X3,X4), (Y1,Y2,Y3,Y4), (C1,C2,C3,C4), rows, cols, idxD)
+end
+
+"""
+    hankelize(D4, Hmap) -> M
+
+Level‑4 block Hankelization of a 4‑D array `D4` given the mapping `Hmap`.
+Returns a matrix `M` of size (∏Y)×(∏C).
+"""
+function hankelize(D4::AbstractArray{ComplexF64,4}, Hmap::HankelMap)
+    M = Matrix{ComplexF64}(undef, Hmap.rows, Hmap.cols)
+    dvec = vec(D4)
+    @inbounds for j in 1:length(Hmap.idxD)
+        M[j] = dvec[Hmap.idxD[j]]
+    end
+    return M
+end
+
+"""
+    dehankelize(M, Hmap) -> D4_est
+
+Anti‑diagonal averaging (folding) back to a 4‑D hypercube using the stored map.
+"""
+function dehankelize(M::AbstractMatrix{ComplexF64}, Hmap::HankelMap)
+    X1, X2, X3, X4 = Hmap.X
+    acc = zeros(ComplexF64, X1, X2, X3, X4)
+    cnt = zeros(Int, X1, X2, X3, X4)
+    mvec = vec(M)
+    @inbounds for j in 1:length(Hmap.idxD)
+        idx = Hmap.idxD[j]
+        acc[idx] += mvec[j]
+        cnt[idx] += 1
+    end
+    D4 = Array{ComplexF64,4}(undef, X1, X2, X3, X4)
+    @inbounds for i in eachindex(acc)
+        D4[i] = cnt[i] == 0 ? 0 : acc[i]/cnt[i]
+    end
+    return D4
+end
+
+# ---------------------- TSVD and damped TSVD ----------------------------------
+
+"""
+    tsvd_reduction(M, K)
+
+Traditional TSVD rank‑reduction: keep top‑K singular triplets and zero the rest.
+Returns the low‑rank approximation matrix.
+"""
+function tsvd_reduction(M::AbstractMatrix{ComplexF64}, K::Int)
+    F = svd(M)
+    K = min(K, length(F.S))
+    U = F.U[:, 1:K]
+    V = F.Vt[1:K, :]
+    S = Diagonal(F.S[1:K])
+    return U * S * V
+end
+
+"""
+    damped_tsvd(M, K, N)
+
+Damped TSVD per eqs. (12)–(15) in the paper. Damping factor `N ≥ 1`.
+If `K == size(M,2)`, we set δ̂=0 (no damping of the retained spectrum).
+"""
+function damped_tsvd(M::AbstractMatrix{ComplexF64}, K::Int, N::Int)
+    F = svd(M)
+    s = F.S
+    K = min(K, length(s))
+    U = F.U[:, 1:K]
+    V = F.Vt[1:K, :]
+    σ1 = s[1:K]
+    δhat = (K < length(s)) ? s[K+1] : 0.0
+    if δhat == 0.0 || N <= 0
+        Sd = Diagonal(σ1)
+    else
+        # damp each kept singular value: σ_i * (1 - (δ/σ_i)^N)
+        fac = @. (1.0 - (δhat/σ1)^N)
+        Sd = Diagonal(σ1 .* fac)
+    end
+    return U * Sd * V
+end
+
+# --------------------- Frequency‑slice filter F / Fd ---------------------------
+
+"""
+    filter_slice(D4, Hmap; K=3, damped=false, N=3)
+
+Apply MSSA (TSVD) or DLR (damped TSVD) to a single frequency slice `D4`.
+Returns the filtered slice with the same shape.
+"""
+function filter_slice(D4::AbstractArray{ComplexF64,4}, Hmap::HankelMap; K=3, damped=false, N=3)
+    M = hankelize(D4, Hmap)
+    M̃ = damped ? damped_tsvd(M, K, N) : tsvd_reduction(M, K)
+    return dehankelize(M̃, Hmap)
+end
+
+# --------------------- Weighted POCS‑like iteration ----------------------------
+
+"""
+    reconstruct(Dobs, mask; K=3, N=3, niter=10, eps=1e-6, damped=false)
+
+Perform the iteration from eq. (16) in the paper in the frequency domain.
+`Dobs` is the complex rFFT along time (size: Nw×nhx×nhy×nx×ny).
+`mask` is Bool array with the same spatial size, broadcast to frequency slices.
+Returns the reconstructed frequency volume.
+"""
+function reconstruct(DobsF::Array{ComplexF64,5}, mask::BitArray{5};
+                     K=3, N=3, niter=10, eps=1e-7, damped=false)
+    Nw, nhx, nhy, nx, ny = size(DobsF)
+    # Spatial sizes for Hankelization
+    Hmap = build_hankel_map(nhx, nhy, nx, ny)
+
+    Dn = copy(DobsF)
+    an = range(1.0, 0.0; length=niter)
+
+    for it = 1:niter
+        @info(@sprintf("Iter %d / %d", it, niter))
+        for w in 1:Nw
+            D4 = @view Dn[w, :, :, :, :]
+            D4f = filter_slice(D4, Hmap; K=K, damped=damped, N=N)
+            # Weighted POCS update per eq. (16):
+            # Dn = an*Dobs + (1 - an*S) .* F(Dn-1)
+            @. D4 = an[it] * DobsF[w, :, :, :, :] + (1 - an[it] * mask[w, :, :, :, :]) * D4f
+        end
+        # early stopping
+        if it > 1 && norm(Dn - DobsF) < eps
+            break
+        end
+    end
+    return Dn
+end
+
+# --------------------------- Metrics & helpers ---------------------------------
+
+"""
+    snr_db(clean, estimate)
+
+Signal‑to‑Noise Ratio in dB, eq. (17) from the paper.
+"""
+function snr_db(clean::AbstractArray, estimate::AbstractArray)
+    s = vec(clean); ŝ = vec(estimate)
+    return 10*log10(sum(abs2, s) / sum(abs2, s .- ŝ))
+end
+
+"""
+    tofreq(D, dt)
+
+rFFT along time (dimension 1). Returns (F, Nw) where F has size
+(Nw, nhx, nhy, nx, ny).
+"""
+function tofreq(D::Array{Float64,5}, dt)
+    F = rfft(D, 1)
+    return F, size(F,1)
+end
+
+"""
+    totime(F, nt)
+
+Inverse rFFT back to time domain.
+"""
+function totime(F::Array{ComplexF64,5}, nt::Int)
+    return irfft(F, nt, 1)
+end
+
+# -------------- Experiment orchestration (synthetic example #1) ----------------
+
+function experiment_synthetic_1(; nt=400, dt=0.004, nhx=11, nhy=11, nx=11, ny=11,
+                                 noise_var=0.25, sampling_ratio=0.3,
+                                 K=3, N=3, niter=10, seed=42,
+                                 do_plots=true)
+    # Clean + noise + missing
+    Dclean = build_synthetic(nt=nt, dt=dt, nhx=nhx, nhy=nhy, nx=nx, ny=ny)
+    Nn = bandlimited_noise(size(Dclean), dt; var=noise_var)
+    Dnoisy = Dclean .+ Nn
+    mask = mask_random(size(Dclean); sampling_ratio=sampling_ratio, seed=seed)
+    Dobs = Dnoisy .* mask
+
+    # FFT along time
+    Fobs, Nw = tofreq(Dobs, dt)
+
+    # Also need complex mask in frequency domain (same across freq)
+    Fmask = falses(size(Fobs))
+    for w in 1:Nw
+        Fmask[w, :, :, :, :] .= mask[w, :, :, :, :]
+    end
+
+    # --- Traditional MSSA (TSVD)
+    Ftrad = reconstruct(Fobs, Fmask; K=K, N=N, niter=niter, damped=false)
+    Dtrad = totime(Ftrad, nt)
+
+    # --- Proposed DLR (damped TSVD)
+    Fprop = reconstruct(Fobs, Fmask; K=K, N=N, niter=niter, damped=true)
+    Dprop = totime(Fprop, nt)
+
+    # Metrics
+    snr_obs  = snr_db(Dclean, Dobs)
+    snr_trad = snr_db(Dclean, Dtrad)
+    snr_prop = snr_db(Dclean, Dprop)
+    @info(@sprintf("SNRs (dB): Observed=%6.2f  Traditional=%6.2f  Proposed=%6.2f",
+                   snr_obs, snr_trad, snr_prop))
+
+    if @isdefined(Plots) && do_plots
+        # Show a CMP cube (x=6, y=6) and a CO cube (hx=6, hy=6) as 2‑D images
+        x0, y0 = 6, 6
+        hx0, hy0 = 6, 6
+
+        # helper to slice to 2-D matrices for heatmaps
+        # CO: fix hx,hy,y -> display time×x (returned as x×time for heatmap)
+        slice_co2d(A)  = permutedims(@view(A[:, hx0, hy0, :, y0]), (2,1))
+        # CMP: fix x,y,hy -> display time×hx (returned as hx×time)
+        slice_cmp2d(A) = permutedims(@view(A[:, :, hy0, x0, y0]), (2,1))
+
+        p1 = plot(layout=(2,3), titlefont=font(10))
+        heatmap!(p1[1,1], slice_co2d(Dclean), title="Clean (CO)", xlabel="X", ylabel="Time")
+        heatmap!(p1[1,2], slice_co2d(Dnoisy), title="Noisy (CO)")
+        heatmap!(p1[1,3], slice_co2d(Dobs),   title="Observed (CO)")
+        heatmap!(p1[2,1], slice_co2d(Dtrad),  title="Traditional (CO)")
+        heatmap!(p1[2,2], slice_co2d(Dprop),  title="Proposed (CO)")
+        plot!(p1[2,3], framestyle=:none)
+        display(p1)
+
+        p2 = plot(layout=(2,3), titlefont=font(10))
+        heatmap!(p2[1,1], slice_cmp2d(Dclean), title="Clean (CMP)", xlabel="HX", ylabel="Time")
+        heatmap!(p2[1,2], slice_cmp2d(Dnoisy), title="Noisy (CMP)")
+        heatmap!(p2[1,3], slice_cmp2d(Dobs),   title="Observed (CMP)")
+        heatmap!(p2[2,1], slice_cmp2d(Dtrad),  title="Traditional (CMP)")
+        heatmap!(p2[2,2], slice_cmp2d(Dprop),  title="Proposed (CMP)")
+        plot!(p2[2,3], framestyle=:none)
+        display(p2)
+
+        # Middle‑trace amplitude comparison (Fig. 5 analog) on CMP slice
+        trc = x0; cly = y0; midhx=Int(ceil(nhx/2)); midhy=Int(ceil(nhy/2))
+        t = collect(0.0:dt:(nt-1)*dt)
+        clean_tr = Dclean[:, midhx, midhy, trc, cly]
+        noisy_tr = Dnoisy[:, midhx, midhy, trc, cly]
+        trad_tr  = Dtrad[:,  midhx, midhy, trc, cly]
+        prop_tr  = Dprop[:,  midhx, midhy, trc, cly]
+        p3 = plot(t, clean_tr, lw=2, label="Clean", xlabel="Time (s)", ylabel="Amplitude")
+        plot!(p3, t, noisy_tr, lw=1, label="Noisy")
+        plot!(p3, t, trad_tr,  lw=2, label="Traditional")
+        plot!(p3, t, prop_tr,  lw=2, label="Proposed")
+        display(p3)
+
+        # Hankel matrix at one frequency (≈26 Hz) for visual comparison
+        # Find closest frequency bin to ~26 Hz
+        Nw = div(nt,2)+1; df = 1.0/(nt*dt); f = (0:Nw-1).*df
+        k26 = argmin(abs.(f .- 26.0))
+        Hmap = build_hankel_map(nhx, nhy, nx, ny)
+        Mc = hankelize(@view(tofreq(Dclean, dt)[1][k26, :, :, :, :]), Hmap)
+        Mo = hankelize(@view(Fobs[k26, :, :, :, :]), Hmap)
+        Mt = hankelize(@view(Ftrad[k26, :, :, :, :]), Hmap)
+        Mp = hankelize(@view(Fprop[k26, :, :, :, :]), Hmap)
+        p4 = plot(layout=(2,2), titlefont=font(9))
+        heatmap!(p4[1,1], real(Mc), title="Hankel Clean @~26Hz", xlabel="Cols", ylabel="Rows")
+        heatmap!(p4[1,2], real(Mo), title="Hankel Observed")
+        heatmap!(p4[2,1], real(Mt), title="Hankel Traditional (10 it)")
+        heatmap!(p4[2,2], real(Mp), title="Hankel Proposed (10 it)")
+        display(p4)
+    end
+
+    return (; Dclean, Dnoisy, Dobs, Dtrad, Dprop, mask, K, N, niter)
+end
+
+# -------------------------- Noise/sampling sweeps ------------------------------
+
+function sweep_noise_levels(; noise_vars=[0.05, 0.10, 0.25, 0.50, 0.75, 1.0],
+                             sampling_ratio=0.3, K=3, N=3, niter=10)
+    snr_trad = Float64[]
+    snr_prop = Float64[]
+    for σ2 in noise_vars
+        R = experiment_synthetic_1(noise_var=σ2, sampling_ratio=sampling_ratio,
+                                   K=K, N=N, niter=niter, do_plots=false)
+        push!(snr_trad, snr_db(R.Dclean, R.Dtrad))
+        push!(snr_prop, snr_db(R.Dclean, R.Dprop))
+    end
+    if @isdefined(Plots)
+        p = plot(noise_vars, snr_trad, lw=2, marker=:o, label="Traditional",
+                 xlabel="Noise variance", ylabel="SNR (dB)")
+        plot!(p, noise_vars, snr_prop, lw=2, marker=:square, label="Proposed")
+        display(p)
+    end
+    return snr_trad, snr_prop
+end
+
+function sweep_sampling_ratios(; sampling_ratios=0.1:0.1:0.8, noise_var=0.25,
+                                K=3, N=3, niter=10)
+    snr_trad = Float64[]
+    snr_prop = Float64[]
+    for ρ in sampling_ratios
+        R = experiment_synthetic_1(noise_var=noise_var, sampling_ratio=ρ,
+                                   K=K, N=N, niter=niter, do_plots=false)
+        push!(snr_trad, snr_db(R.Dclean, R.Dtrad))
+        push!(snr_prop, snr_db(R.Dclean, R.Dprop))
+    end
+    if @isdefined(Plots)
+        p = plot(collect(sampling_ratios).*100, snr_trad, lw=2, marker=:o,
+                 xlabel="Sampling ratio (%)", ylabel="SNR (dB)", label="Traditional")
+        plot!(p, collect(sampling_ratios).*100, snr_prop, lw=2, marker=:square, label="Proposed")
+        display(p)
+    end
+    return snr_trad, snr_prop
+end
+
+# ---------------------------------- main() ------------------------------------
+
+function main()
+    @info "Running synthetic example #1 (parameters chosen per the paper: K=3, N=3, niter=10)"
+    R = experiment_synthetic_1(K=3, N=3, niter=10)
+
+    @info "Noise‑level sweep (Fig. 11 analog)"
+    sweep_noise_levels()
+
+    @info "Sampling‑ratio sweep (Fig. 12 analog)"
+    sweep_sampling_ratios()
+
+    println("\nDone. Figures displayed where Plots.jl is available.")
+end
+
+# Uncomment to run when file is included directly
+ main()

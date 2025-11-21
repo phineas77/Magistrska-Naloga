@@ -1,0 +1,236 @@
+###############################
+# Odvisnosti
+###############################
+using Random
+using LinearAlgebra          # svd, Diagonal, norm
+using Statistics             # mean, median
+using Plots
+using LaTeXStrings
+using Printf
+
+###############################
+# Hankel operatorji
+###############################
+
+"""
+    hankel_matrix(d; M=nothing) -> H
+
+Zgradi Hankelovo matriko H velikosti M×N iz vektorja d (dolžine L), kjer velja M + N - 1 = L.
+Če `M` ni podan, se uporabi bližnje-kvadratni M = ⌊L/2⌋ + 1.
+"""
+function hankel_matrix(d::Vector{T}; M::Union{Int,Nothing}=nothing) where T
+    L = length(d)
+    if M === nothing
+        M = fld(L, 2) + 1
+    end
+    @assert 1 ≤ M ≤ L "M mora biti v [1, L]"
+    N = L - M + 1
+    @assert N ≥ 1 "Za izbrani M je N = L - M + 1 < 1"
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M, j in 1:N
+        H[i, j] = d[i + j - 1]
+    end
+    return H
+end
+
+"""
+    inv_hankel(H) -> d_est
+
+Inverz Hankelove transformacije: povpreči elemente vzdolž antidiagonal.
+"""
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M, j in 1:N
+        k = i + j - 1
+        d_est[k] += H[i, j]
+        counts[k] += 1
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+"""
+    proj_hankel(A) -> H_proj
+
+Projekcija matrike na Hankelovo strukturo z izenačenjem vrednosti po antidiagonalah.
+"""
+function proj_hankel(A::AbstractMatrix{T}) where T
+    M, N = size(A)
+    H_proj = similar(A)
+    L = M + N - 1
+    @inbounds for k in 1:L
+        vals = T[]
+        for i in 1:M
+            j = k - i + 1
+            if 1 ≤ j ≤ N
+                push!(vals, A[i, j])
+            end
+        end
+        avg_val = mean(vals)
+        for i in 1:M
+            j = k - i + 1
+            if 1 ≤ j ≤ N
+                H_proj[i, j] = avg_val
+            end
+        end
+    end
+    return H_proj
+end
+
+###############################
+# Nizkorang projekcija (adaptivni rang)
+###############################
+
+"""
+    adaptive_proj_low_rank(A; verbose=true) -> L
+
+Adaptivna nizkorang aproksimacija z uporabo SVD.
+Prag temelji na β = min(M, N)/max(M, N); s tem deluje korektno tudi za pravokotne oblike.
+"""
+function adaptive_proj_low_rank(A::AbstractMatrix{T}; verbose::Bool=true) where T
+    M, N = size(A)
+    β = min(M, N) / max(M, N)                       # razmerje stranic v [0, 1]
+    c_val = 0.56*β^3 - 0.95*β^2 + 1.82*β + 1.43     # pragovni faktor
+
+    # SVD
+    U, S, V = svd(A)                                # S :: Vector{<:Real}
+    σmed = median(S)
+    R = count(σ -> σ ≥ c_val * σmed, S)
+
+    if verbose
+        @info "Uporabljen rank: $R (β=$(round(β, digits=3)))"
+    end
+    if R == 0
+        return zeros(T, M, N)
+    end
+
+    # Trunkacija spektra
+    S_trunc = zeros(eltype(S), length(S))
+    @inbounds for i in 1:min(R, length(S))
+        S_trunc[i] = S[i]
+    end
+    return U * Diagonal(S_trunc) * V'
+end
+
+###############################
+# HLR denoiser
+###############################
+
+"""
+    hlr_denoise(d, Nite, λ; M=nothing, verbose=false) -> s_est
+
+HLR z adaptivnim izborom ranga. `M` določa število vrstic Hankelove matrike (pravokotnost).
+"""
+function hlr_denoise(d::Vector{T}, Nite::Int, λ::Real;
+                     M::Union{Int,Nothing}=nothing, verbose::Bool=false) where T
+    # Hankel iz vhodnega signala
+    D = hankel_matrix(d; M=M)
+
+    # Inicializacija z nizkorang aproksimacijo
+    L = adaptive_proj_low_rank(D; verbose=verbose)
+    H_mat = similar(D)
+
+    @inbounds for k in 1:Nite
+        # H_{k+1} = 1/(1+λ) * P_H(D + λ * L)
+        H_mat = proj_hankel(D .+ λ .* L)
+        H_mat .*= (1 / (1 + λ))
+
+        # L_{k+1} = adaptivna projekcija H_mat na nizki rang
+        L = adaptive_proj_low_rank(H_mat; verbose=verbose)
+    end
+
+    # Inverz Hankel -> signal
+    return inv_hankel(H_mat)
+end
+
+###############################
+# Metrika
+###############################
+
+"""
+    compute_snr(clean, est) -> snr_dB
+"""
+function compute_snr(clean::Vector{T}, est::Vector{T}) where T
+    num = norm(clean)^2
+    den = norm(clean .- est)^2
+    return 10 * log10(num / den)
+end
+
+###############################
+# Eksperiment: pravokotne vs. kvadratne Hankelove
+###############################
+
+# --- Sintetični podatki (primer) ---
+t = 1:50
+clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# --- Parametri HLR ---
+λ   = 27
+Nit = 3
+
+# --- M-mreža (različne pravokotnosti) ---
+L = length(clean_signal)
+# izogni se skrajnim primerom, a dovoli širok razpon
+M_grid = collect(3:(L-1))              # M ∈ [3, L-1] ⇒ N = L - M + 1 ≥ 2
+
+snr_vals = zeros(Float64, length(M_grid))
+
+# utišaj izpise ranga pri množičnih testih
+hlr_quiet(x; M::Union{Int,Nothing}=nothing) = redirect_stdout(devnull) do
+    hlr_denoise(x, Nit, λ; M=M, verbose=false)
+end
+
+@info "Začenjam preizkus po M (λ=$λ, N=$Nit, L=$L) ..."
+for (k, Mval) in enumerate(M_grid)
+    den = hlr_quiet(noisy_signal; M=Mval)
+    snr_vals[k] = compute_snr(clean_signal, den)
+end
+
+best_idx = argmax(snr_vals)
+best_M   = M_grid[best_idx]
+best_N   = L - best_M + 1
+best_SNR = snr_vals[best_idx]
+
+@info @sprintf("Najboljši M = %d (N = %d), SNR = %.2f dB", best_M, best_N, best_SNR)
+
+# --- Prikaz: SNR(M) in primer signalov pri najboljšem M ---
+default(fontfamily="Computer Modern", titlefont=14, guidefont=12, tickfont=10, legendfont=10)
+
+# SNR( M )
+p1 = plot(M_grid, snr_vals; lw=2, markershape=:circle, markerstrokewidth=0,
+    xlabel = "M  (št. vrstic hankelove matrike)",
+    ylabel = "SNR [dB]",
+    title  = @sprintf("Uspešnost HLR algoritma v odvisnosti od števila vrstic M (λ=%d, N=%d, L=%d)", λ, Nit, L),
+    legend=false, framestyle=:box)
+
+# Označi kvadratni približek in maksimum
+M_sq = fld(L, 2) + 1
+vline!(p1, [M_sq]; label=false, lw=1, ls=:dash)
+annotate!(p1, M_sq, minimum(snr_vals),
+          text(@sprintf(" ~kvadratni M=%d", M_sq), 9, :left))
+scatter!(p1, [best_M], [best_SNR], markershape=:star5, ms=8, label=false)
+annotate!(p1, best_M, best_SNR, text(@sprintf(" max @ M=%d", best_M), 10, :left))
+
+# Signali pri najboljšem M
+best_denoised = hlr_quiet(noisy_signal; M=best_M)
+p2 = plot(t, clean_signal; lw=2, label="Čisti")
+plot!(p2, t, noisy_signal;  lw=2, ls=:dash, label="Šumni")
+plot!(p2, t, best_denoised; lw=2, ls=:dot,  label=@sprintf("Očiščen (M=%d, N=%d)", best_M, best_N))
+xlabel!(p2, "Čas")
+ylabel!(p2, "Amplituda")
+title!(p2, @sprintf("Primer signalov pri najboljšem M=%d (SNR=%.2f dB)", best_M, best_SNR))
+plot!(p2; framestyle=:box)
+
+
+
+plt = plot(p1, p2; layout=(2,1), size=(900,700))
+savefig(plt, "hlr_Pravokoten.pdf")

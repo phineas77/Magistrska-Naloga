@@ -1,0 +1,273 @@
+using LinearAlgebra
+using Statistics
+using Plots
+using Random
+using Measures   # za robove pri grafih
+
+# ===========================
+# Hankel helpers (1D)
+# ===========================
+# Sestavi Hankelovo matriko iz vektorja d.
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = fld(L, 2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            H[i, j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+# Inverzni Hankelov operator: povpreči elemente vzdolž antidiagonale.
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i, j]
+            counts[k] += 1
+        end
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# ===========================
+# OS11 core: single-pass MSSA
+# ===========================
+# En prehod MSSA z znižanjem ranga.
+# VRNE: (očiščeni_signal, r_used)
+function mssa_denoise(d::Vector{T}, R::Int) where T
+    D = hankel_matrix(d)
+    F = svd(D)
+    U, S, Vt = F.U, F.S, F.Vt
+    r_used = min(R, length(S))
+    D_denoised = U[:, 1:r_used] * Diagonal(S[1:r_used]) * Vt[1:r_used, :]
+    d_est = inv_hankel(D_denoised)
+    return d_est, r_used
+end
+
+# ===========================
+# OS11 iterative denoising ONLY (no reconstruction, no α-blending)
+# ===========================
+# Čista iteracija: d_m = F(d_{m-1})
+# Če podate clean_ref, vrne tudi zgodovino SNR po iteracijah.
+function mssa_denoise_iter_pure(d_obs::Vector{T}, R::Int; mmax::Int=6, clean_ref::Union{Nothing,Vector{T}}=nothing) where T
+    d_m = copy(d_obs)
+    snr_hist = Float64[]
+    for m in 1:mmax
+        d_m, _ = mssa_denoise(d_m, R)
+        if clean_ref !== nothing
+            push!(snr_hist, 10 * log10(norm(clean_ref)^2 / norm(clean_ref - d_m)^2))
+        end
+    end
+    return d_m, snr_hist
+end
+
+# ===========================
+# Merilo kakovosti
+# ===========================
+function compute_snr(C::Vector{T}, A::Vector{T}) where T
+    10 * log10(norm(C)^2 / norm(C - A)^2)
+end
+
+# ===========================
+# Demo / test
+# ===========================
+# Sintetičen čist signal
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+
+# Dodaj šum (baseline primer)
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Parametri
+R = 2           # ciljni rang za MSSA
+mmax = 100      # št. iteracij OS11 (čista iteracija)
+
+# En prehod (baseline)
+elapsed_once = @elapsed begin
+    denoised_once, r_used = mssa_denoise(noisy_signal, R)
+end
+snr_once = compute_snr(clean_signal, denoised_once)
+println("MSSA en prehod: r_used = $r_used, SNR = $(round(snr_once, digits=3)) dB, čas = $(round(elapsed_once, digits=4)) s")
+
+# Iterativni OS11 denoising (čisto F∘F∘...∘F)
+elapsed_iter = @elapsed begin
+    denoised_iter, snr_hist = mssa_denoise_iter_pure(noisy_signal, R; mmax=mmax, clean_ref=clean_signal)
+end
+best_it = !isempty(snr_hist) ? argmax(snr_hist) : 0
+best_snr = !isempty(snr_hist) ? snr_hist[best_it] : NaN
+println("MSSA iterativno (čista iteracija): najboljši SNR = $(round(best_snr, digits=3)) dB pri iteraciji $best_it, čas = $(round(elapsed_iter, digits=4)) s")
+
+# ===========================
+# Vizualizacija (baseline)
+# ===========================
+# Signali
+p1 = plot(t, clean_signal, label="Čisti signal", lw=2,
+          left_margin=8mm, bottom_margin=6mm)
+plot!(p1, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p1, t, denoised_once, label="MSSA en prehod", lw=2, ls=:dot)
+plot!(p1, t, denoised_iter, label="MSSA iterativno ($(mmax))", lw=2, ls=:dashdot)
+xlabel!(p1, "Čas")
+ylabel!(p1, "Amplituda")
+title!(p1, "MSSA razšumljanje (en prehod vs. čista iteracija)")
+display(p1)
+
+# SNR po iteracijah
+p2 = plot(1:length(snr_hist), snr_hist, marker=:circle, lw=2, label="SNR",
+          left_margin=8mm, bottom_margin=6mm)
+if !isempty(snr_hist)
+    vline!(p2, [best_it], ls=:dash, label="Najboljša iteracija = $best_it")
+    annotate!(p2, (best_it, best_snr), text("max $(round(best_snr, digits=2)) dB", 8, :left))
+end
+xlabel!(p2, "Iteracija")
+ylabel!(p2, "SNR (dB)")
+title!(p2, "Napredek SNR skozi iteracije (Čista iteracija)")
+display(p2)
+
+# ======================================
+# Iskanje optimalnega ranga po nivojih šuma
+# ======================================
+noise_levels = 0.1:0.1:0.9
+L = length(clean_signal)
+
+# Za pošteno primerjavo: isti "unit" šum za vse σ
+noise_unit = randn(MersenneTwister(4321), L)
+
+M = fld(L, 2) + 1
+N = L - M + 1
+rank_limit = min(M, N)
+R_candidates = collect(1:min(15, rank_limit))  # 1..15
+
+nR = length(R_candidates)
+nS = length(collect(noise_levels))
+
+snr_single = zeros(Float64, nR, nS)      # SNR za en MSSA prehod
+snr_iter_best = zeros(Float64, nR, nS)   # najboljši SNR čez iteracije OS11
+
+# Glavna mreža po (σ, R)
+for (j, σ) in enumerate(noise_levels)
+    noisy = clean_signal .+ σ .* noise_unit
+    for (i, Rtest) in enumerate(R_candidates)
+        # en prehod MSSA
+        den1, _ = mssa_denoise(noisy, Rtest)
+        snr_single[i, j] = compute_snr(clean_signal, den1)
+
+        # iterativni OS11
+        _, snr_hist_R = mssa_denoise_iter_pure(noisy, Rtest; mmax=mmax, clean_ref=clean_signal)
+        snr_iter_best[i, j] = isempty(snr_hist_R) ? NaN : maximum(snr_hist_R)
+    end
+end
+
+# Izberi najboljši R za vsak σ
+best_R_single = zeros(Int, nS)
+best_SNR_single = zeros(Float64, nS)
+best_R_iter   = zeros(Int, nS)
+best_SNR_iter = zeros(Float64, nS)
+
+for j in 1:nS
+    i_single = argmax(snr_single[:, j])
+    best_R_single[j] = R_candidates[i_single]
+    best_SNR_single[j] = snr_single[i_single, j]
+
+    i_iter = argmax(snr_iter_best[:, j])
+    best_R_iter[j] = R_candidates[i_iter]
+    best_SNR_iter[j] = snr_iter_best[i_iter, j]
+end
+
+println("\n============================")
+println("Najboljši rang po nivojih šuma (σ)")
+println("============================")
+for (jj, σ) in enumerate(noise_levels)
+    println("σ = $(round(σ, digits=1)):  en prehod -> R* = $(best_R_single[jj]) (SNR = $(round(best_SNR_single[jj], digits=3)) dB) | " *
+            "iterativno -> R* = $(best_R_iter[jj]) (SNR = $(round(best_SNR_iter[jj], digits=3)) dB)")
+end
+
+# ======================================
+# Vizualizacija rezultatov iskanja
+# ======================================
+# Heatmap SNR (en prehod)
+pH1 = heatmap(collect(noise_levels), R_candidates, snr_single;
+    xlabel = "σ šuma",
+    ylabel = "Rang R",
+    title = "SNR (dB) – MSSA en prehod",
+    colorbar_title = "SNR (dB)",
+    left_margin = 8mm, bottom_margin = 6mm)
+
+# Heatmap SNR (iterativno)
+pH2 = heatmap(collect(noise_levels), R_candidates, snr_iter_best;
+    xlabel = "σ šuma",
+    ylabel = "Rang R",
+    title = "SNR (dB) – MSSA iterativno",
+    colorbar_title = "SNR (dB)",
+    left_margin = 8mm, bottom_margin = 6mm)
+
+display(pH1); display(pH2)
+
+# Najboljši R vs. σ
+pR = plot(collect(noise_levels), best_R_single;
+    lw=2, marker=:circle, label="en prehod",
+    xlabel="σ šuma", ylabel="Najboljši rang R",
+    title="Najboljši R po nivojih šuma",
+    left_margin=8mm, bottom_margin=6mm)
+plot!(pR, collect(noise_levels), best_R_iter; lw=2, marker=:diamond, label="iterativno")
+display(pR)
+
+# Najboljši dosežen SNR vs. σ
+pS = plot(collect(noise_levels), best_SNR_single;
+    lw=2, marker=:circle, label="en prehod",
+    xlabel="σ šuma", ylabel="Najboljši SNR (dB)",
+    title="Najboljši SNR po nivojih šuma",
+    left_margin=8mm, bottom_margin=6mm)
+plot!(pS, collect(noise_levels), best_SNR_iter; lw=2, marker=:diamond, label="iterativno")
+display(pS)
+
+# Shranjevanje posamičnih (po želji)
+# savefig(pH1, "heatmap_single.png")
+# savefig(pH2, "heatmap_iter.png")
+# savefig(pR,  "best_rank_vs_sigma.png")
+# savefig(pS,  "best_snr_vs_sigma.png")
+
+# FIGURE 1: 4 grafi v mreži 2×2
+lyt1 = @layout [a b; c d]
+fig1 = plot(pH1, pH2, pR, pS;
+            layout = lyt1,
+            size = (1200, 900),
+            outer_margin = 5mm,
+            left_margin = 8mm,
+            bottom_margin = 6mm)
+savefig(fig1, "os11_mssa_fig1.pdf")
+# display(fig1)  # po želji
+
+# FIGURE 2: 2 grafa en pod drugim
+lyt2 = @layout [a; b]
+fig2 = plot(p1, p2;
+            layout = lyt2,
+            size = (1200, 900),
+            outer_margin = 5mm,
+            left_margin = 8mm,
+            bottom_margin = 6mm)
+savefig(fig2, "os11_mssa_fig2.pdf")
+# display(fig2)  # po želji
+
+
+# Združen prikaz
+# lyt = @layout [a b; c d; e f]   # 3 vrstice × 2 stolpca
+# plt_all = plot(pH1, pH2, pR, pS, p1, p2;
+#                layout = lyt,
+#                size = (1200, 1600),
+#                outer_margin = 5mm,
+#                left_margin = 8mm)
+
+# savefig(plt_all, "os11_mssa_all_plots02.pdf")

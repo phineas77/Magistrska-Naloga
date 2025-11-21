@@ -1,0 +1,318 @@
+###############################
+# Australian Wine — HLR (Wang & Zhu 2019) used for reconstruction via POCS
+# Poravnano s SSA / QR testom:
+#  - osrednja vrzel: indeksi 60..71
+#  - končni blok (maskiran): indeksi 121..133
+#  - RMSE in slike: ocenjujemo le do indeksa 132 (zadnji mesec izločen)
+###############################
+
+using LinearAlgebra, Statistics, CSV, DataFrames, Dates, Plots, Printf
+
+# ------------------------
+# Hankel & inverse Hankel
+# ------------------------
+function hankel_matrix(d::AbstractVector{T}) where T
+    L = length(d)
+    M = floor(Int, L/2) + 1           # ≈ L/2 + 1 (as in the paper)
+    N = L - M + 1
+    H = Matrix{T}(undef, M, N)
+    @inbounds for i in 1:M, j in 1:N
+        H[i, j] = d[i + j - 1]
+    end
+    return H
+end
+
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M, j in 1:N
+        k = i + j - 1
+        d_est[k] += H[i, j]
+        counts[k] += 1
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# Orthogonal projection onto the Hankel set (average along anti-diagonals)
+function proj_hankel(A::AbstractMatrix{T}) where T
+    M, N = size(A)
+    Hproj = similar(A)
+    L = M + N - 1
+    @inbounds for k in 1:L
+        s = zero(T); c = 0
+        for i in 1:M
+            j = k - i + 1
+            if 1 <= j <= N
+                s += A[i,j]; c += 1
+            end
+        end
+        μ = s / c
+        for i in 1:M
+            j = k - i + 1
+            if 1 <= j <= N
+                Hproj[i,j] = μ
+            end
+        end
+    end
+    return Hproj
+end
+
+# ---------------------------------------------
+# Rank selection (Gavish–Donoho-style threshold)
+# c(r) = 0.56 r^3 - 0.95 r^2 + 1.82 r + 1.43, with r in (0,1]
+# ---------------------------------------------
+function adaptive_rank_from_svals(s::AbstractVector, M::Int, N::Int)
+    r = min(M,N) / max(M,N)
+    c = 0.56*r^3 - 0.95*r^2 + 1.82*r + 1.43
+    σmed = median(s)
+    R = count(σ -> σ >= c*σmed, s)
+    return max(min(R, min(M,N)), 0)
+end
+
+# Best rank-R approximation via truncated SVD
+function best_rank_approx(A::AbstractMatrix, R::Int)
+    R == 0 && return zero(A)
+    F = svd(A; full=false)
+    r = min(R, length(F.S))
+    U1 = @view F.U[:, 1:r]
+    Σ1 = Diagonal(@view F.S[1:r])
+    V1t = @view F.Vt[1:r, :]
+    return U1 * Σ1 * V1t
+end
+
+# -------------------------------------------------
+# HLR inner loop (Algorithm 1 from WZ19)
+#   Inputs: current signal y -> D = H(y)
+#   Returns: filtered signal y_filt, and per-iteration ranks used in PL(·)
+# -------------------------------------------------
+function hlr_filter_1d(y::AbstractVector{T};
+                       λ::Real=10, Nite::Int=4,
+                       adaptive_rank::Bool=true, R_fix::Int=10) where T
+
+    D = hankel_matrix(y)
+    M, N = size(D)
+
+    # initialization L0 = P_L(D) (rank either adaptive or fixed)
+    F0 = svd(D; full=false)
+    R0 = adaptive_rank ? adaptive_rank_from_svals(F0.S, M, N) : min(R_fix, length(F0.S))
+    L = best_rank_approx(D, R0)
+
+    ranks = Int[]
+    Hk = similar(D)
+    for _k in 1:Nite
+        # H_{k+1} = (1/(1+λ)) * P_H(D + λ L_k)
+        Hk .= proj_hankel(D .+ λ .* L)
+        Hk .*= (1 / (1 + λ))  # closed-form scale
+
+        # L_{k+1} = P_L(H_{k+1})
+        Fk = svd(Hk; full=false)
+        Rk = adaptive_rank ? adaptive_rank_from_svals(Fk.S, M, N) : min(R_fix, length(Fk.S))
+        push!(ranks, Rk)
+        L = best_rank_approx(Hk, Rk)
+    end
+
+    y_filt = inv_hankel(Hk)
+    return y_filt, ranks
+end
+
+# -------------------------------------------------
+# POCS wrapper for reconstruction with HLR as the filter
+#   - y_obs may contain missings
+#   - α schedule: 1 → 0 (noisy) or α=1 (noiseless)
+# -------------------------------------------------
+function hlr_impute(y_obs::Vector{<:Union{Missing,Number}};   # ← only one ';'
+                    λ::Real=10, Nite::Int=4,
+                    adaptive_rank::Bool=true, R_fix::Int=10,
+                    maxiter::Int=10, tol::Float64=1e-6, noiseless::Bool=false)
+
+    mask = .!ismissing.(y_obs)
+    vals = collect(skipmissing(y_obs))
+    μ = isempty(vals) ? 0.0 : Float64(mean(vals))
+
+    # initialize: observed stay; missing = mean
+    y_est = Float64[mask[i] ? Float64(y_obs[i]) : μ for i in eachindex(y_obs)]
+
+    prev = copy(y_est)
+    rank_trace = Vector{Int}[]  # store inner ranks per outer iteration
+
+    for it in 1:maxiter
+        y_filt, ranks = hlr_filter_1d(y_est; λ=λ, Nite=Nite,
+                                      adaptive_rank=adaptive_rank, R_fix=R_fix)
+        push!(rank_trace, ranks)
+
+        α = noiseless ? 1.0 : max(0.0, 1 - (it-1)/max(1, maxiter-1))  # 1→0
+        @inbounds for i in eachindex(y_est)
+            y_est[i] = mask[i] ? α*Float64(y_obs[i]) + (1-α)*y_filt[i] : y_filt[i]
+        end
+
+        if norm(y_est - prev) / max(norm(prev), eps()) < tol
+            break
+        end
+        prev .= y_est
+    end
+    return y_est, rank_trace
+end
+
+# ------------------------
+# RMSE helper
+# ------------------------
+compute_rmse(y_true::AbstractVector, y_pred::AbstractVector) =
+    sqrt(mean((y_true .- y_pred) .^ 2))
+
+# ------------------------
+# Axis helpers
+# ------------------------
+function detect_axis(df::DataFrame)
+    for c in names(df)
+        cl = lowercase(String(c))
+        if occursin("date", cl) || occursin("month", cl) || occursin("time", cl)
+            col = df[!, c]
+            try
+                return Date.(col), true
+            catch
+                s = string.(col)
+                for fmt in (dateformat"y-m-d", dateformat"y-m", dateformat"yyyy-mm-dd", dateformat"yyyy-mm")
+                    try
+                        return Date.(s, fmt), true
+                    catch; end
+                end
+            end
+        end
+    end
+    return collect(1:nrow(df)), false
+end
+
+# ------------------------
+# Load Australian Wine
+# ------------------------
+csv_path = "AustralianWine.csv"
+@assert isfile(csv_path) "CSV not found at: $(csv_path)"
+df = CSV.read(csv_path, DataFrame)
+
+series_col = (:Fortified in names(df)) ? :Fortified : begin
+    numcols = [c for c in names(df) if eltype(df[!, c]) <: Union{Missing, Real}]
+    @assert !isempty(numcols) "No numeric column found in the CSV."
+    numcols[1]
+end
+
+y_raw = df[!, series_col]
+y = collect(skipmissing(y_raw)) .|> Float64
+@assert length(y) == nrow(df)
+
+x, have_dates = detect_axis(df)
+N = length(y)
+
+# ------------------------
+# Indeksi (enaki kot v SSA / DLR / QR kodah)
+# ------------------------
+N0 = 121
+@assert N ≥ N0 + 12           # potrebujemo vsaj do indeksa 133
+
+idx_mid = 60:71               # osrednja vrzel (12 točk)
+idx_end = N0:(N0+12)          # 121:133 (13-točkovni končni blok)
+
+Nplot        = N0 + 12 - 1    # 132 (zadnji mesec izločen)
+idx_total    = 1:Nplot        # 1:132
+idx_end_eval = first(idx_end):(last(idx_end)-1)  # 121:132
+
+# ------------------------
+# Manjkajoča merjenja za HLR-POCS (isto kot SSA / DLR)
+# ------------------------
+y_work = Vector{Union{Missing, Float64}}(y)
+y_work[idx_mid] .= missing
+y_work[idx_end] .= missing
+
+# ------------------------
+# Run HLR-POCS (fixed vs adaptive)
+# ------------------------
+λ    = 10
+Nite = 4
+R_fix = 13   # fixed rank to compare against adaptive
+
+@time y_hat_fix,   ranks_fix   = hlr_impute(y_work; λ=λ, Nite=Nite,
+                                            adaptive_rank=false, R_fix=R_fix, maxiter=10)
+@time y_hat_adapt, ranks_adapt = hlr_impute(y_work; λ=λ, Nite=Nite,
+                                            adaptive_rank=true,  R_fix=R_fix, maxiter=10)
+
+println("\nRANK TRACE PER OUTER ITERATION (inner PL ranks each step):")
+println("  fixed:    ", ranks_fix)
+println("  adaptive: ", ranks_adapt)
+
+# ------------------------
+# Plots – 3 panela pod sabo, kot pri SSA / DLR
+# ------------------------
+obs_with_gaps = copy(y)
+obs_with_gaps[idx_mid] .= NaN
+obs_with_gaps[idx_end] .= NaN
+
+# (a) Popolna časovna vrsta
+p4a = plot(x[1:N0], y[1:N0];
+           lw=2,
+           xlabel=have_dates ? "Datum" : "Indeks",
+           ylabel="Tisoč litrov",
+           title="(a) Originalna serija (Australian wines)",
+           legend=false)
+
+# (b) Vrsta z osrednjo vrzeljo in končnim blokom
+p4b = plot(x[1:Nplot], obs_with_gaps[1:Nplot];
+           lw=2,
+           xlabel=have_dates ? "Datum" : "Indeks",
+           ylabel="Tisoč litrov",
+           title="(b) Manjkajoči sredinski blok + 12 na koncu",
+           legend=false)
+
+# (c) HLR-POCS rekonstrukcija (do Nplot)
+p5 = plot(x[1:Nplot], y[1:Nplot];
+          ls=:dash, lw=2, label="Opazovano",
+          xlabel=have_dates ? "Datum" : "Indeks",
+          ylabel="Tisoč litrov",
+          title="Rekonstrukcija z metodo HLR")
+
+plot!(p5, x[1:Nplot], y_hat_fix[1:Nplot];   lw=2, ls=:dot, label="HLR (fiksni R = $R_fix)")
+plot!(p5, x[1:Nplot], y_hat_adapt[1:Nplot]; lw=2, label="HLR (adaptivni R)")
+
+# Vse 3 slike v enem figu, pod sabo (samo prikažemo)
+p_all = plot(p4a, p4b, p5; layout=(3,1), size=(900,1000))
+display(p_all)
+
+# *** shranimo SAMO zadnjo sliko (rekonstrukcijo) ***
+display(p5)
+savefig(p5, "hlr_awine_pocs.pdf")
+
+# ------------------------
+# RMSE – enako kot pri SSA / DLR (sredina, konec, skupaj)
+# ------------------------
+rmse_mid_fix   = compute_rmse(y[idx_mid],      y_hat_fix[idx_mid])
+rmse_mid_adapt = compute_rmse(y[idx_mid],      y_hat_adapt[idx_mid])
+
+rmse_end_fix   = compute_rmse(y[idx_end_eval], y_hat_fix[idx_end_eval])
+rmse_end_adapt = compute_rmse(y[idx_end_eval], y_hat_adapt[idx_end_eval])
+
+rmse_tot_fix   = compute_rmse(y[idx_total],    y_hat_fix[idx_total])
+rmse_tot_adapt = compute_rmse(y[idx_total],    y_hat_adapt[idx_total])
+
+@printf("\nRMSE povzetek (HLR-POCS, QR-slog indeksov):\n")
+@printf("  Sredina (indeksi %d–%d):  fiksni R=%d → %.6f,  adaptivni → %.6f\n",
+        first(idx_mid), last(idx_mid), R_fix, rmse_mid_fix, rmse_mid_adapt)
+@printf("  Konec   (indeksi %d–%d):  fiksni R=%d → %.6f,  adaptivni → %.6f\n",
+        first(idx_end_eval), last(idx_end_eval), R_fix, rmse_end_fix, rmse_end_adapt)
+@printf("  Skupaj  (indeksi %d–%d):  fiksni R=%d → %.6f,  adaptivni → %.6f\n",
+        first(idx_total), last(idx_total), R_fix, rmse_tot_fix, rmse_tot_adapt)
+
+println("\nHLR rekonstruirane vrednosti (adaptivni R) – srednja vrzel (60–71):")
+for i in idx_mid
+    @printf("  %3d  ocena=%12.6f   original=%12.6f   napaka=%+10.6f\n",
+            i, y_hat_adapt[i], y[i], y_hat_adapt[i]-y[i])
+end
+
+println("\nHLR rekonstruiran končni blok (adaptivni R) – 121–132 (ocenjevalno območje):")
+for i in idx_end_eval
+    lab = have_dates ? string(x[i]) : string(i)
+    @printf("  %s  ocena=%12.6f   original=%12.6f   napaka=%+10.6f\n",
+            lab, y_hat_adapt[i], y[i], y_hat_adapt[i]-y[i])
+end

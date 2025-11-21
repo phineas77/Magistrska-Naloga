@@ -1,0 +1,122 @@
+using LinearAlgebra, Statistics, Plots, Random
+
+# Funkcija za konstrukcijo Hankelove matrike iz 1D vektorja d.
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = floor(Int, L/2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    for i in 1:M
+        for j in 1:N
+            H[i, j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+# Funkcija za inverzni Hankelov operator: povpreči elemente vzdolž antidiagonale.
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    for i in 1:M
+        for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i, j]
+            counts[k] += 1
+        end
+    end
+    for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# Funkcija za MSSA odstranjevanje šuma (enostopenjski znižanje ranga).
+# VRNE: (očiščeni_signal, r_used), kjer je r_used dejansko uporabljen rang.
+function mssa_denoise(d::Vector{T}, R::Int) where T
+    # Oblikuj Hankelovo matriko iz šumnega signala.
+    D = hankel_matrix(d)
+    # Izračunaj singularno vrednostno razcep (SVD).
+    F = svd(D)
+    U, S, Vt = F.U, F.S, F.Vt
+    # Ohrani le prvih r_used singularnih vrednosti.
+    r_used = min(R, length(S))
+    # Rekonstruiraj očiščeno Hankelovo matriko s pomočjo skrajšanega SVD.
+    D_denoised = U[:, 1:r_used] * Diagonal(S[1:r_used]) * Vt[1:r_used, :]
+    # Inverz Hankelovega operatorja za rekonstrukcijo očiščenega signala.
+    d_est = inv_hankel(D_denoised)
+    return d_est, r_used
+end
+
+function compute_snr(C::Vector{T}, A::Vector{T}) where T
+    snr = 10 * log10(norm(C)^2 / norm(C - A)^2)
+    return snr
+end
+
+# --- Preizkus MSSA algoritma na istem primeru kot HLR koda ---
+
+# Ustvari sintetičen čist signal (sinusni val).
+t = 1:50
+# clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+clean_signal = [sin(0.2 * i) for i in t]
+
+# Dodaj naključen šum k čistemu signalu.
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Nastavi ciljni rang za MSSA filter (za prikaz).
+R = 2
+
+# Uporabi MSSA algoritme za odstranjevanje šuma iz izmer čas.
+elapsed_time = @elapsed begin
+    denoised_signal, r_used = mssa_denoise(noisy_signal, R)
+    println("Uporabljen adaptivni rang: ", r_used)
+end
+println("Čas izvajanja algoritma: ", elapsed_time, " sekunde")
+
+snr_value = compute_snr(clean_signal, denoised_signal)
+println("Izračunan SNR (R=$R): ", snr_value, " dB")
+
+# Prikaži rezultate: čist, šumni in očiščen signal.
+p = plot(t, clean_signal, label="Čisti signal", lw=2)
+plot!(p, t, noisy_signal, label="Šumni signal", lw=2, ls=:dash)
+plot!(p, t, denoised_signal, label="Očiščen signal (MSSA)", lw=2, ls=:dot)
+xlabel!("Čas"); ylabel!("Amplituda"); title!("Primer MSSA odstranjevanja šuma")
+display(p)
+
+# === Sweep rangov 1..100 in poročaj SNR na grafu ===
+
+# Precompute SVD enkrat (hitreje)
+D = hankel_matrix(noisy_signal)
+F = svd(D)
+U, S, Vt = F.U, F.S, F.Vt
+rmax = length(S)  # največje možno število ohranjenih singularnih vrednosti
+
+rangi = 1:100
+snr_vals = zeros(Float64, length(rangi))
+
+for (idx, Rtest) in enumerate(rangi)
+    r_used = min(Rtest, rmax)
+    D_denoised = U[:, 1:r_used] * Diagonal(S[1:r_used]) * Vt[1:r_used, :]
+    d_est = inv_hankel(D_denoised)
+    snr_vals[idx] = compute_snr(clean_signal, d_est[1:length(clean_signal)])
+end
+
+best_idx = argmax(snr_vals)
+best_R = rangi[best_idx]
+best_SNR = snr_vals[best_idx]
+println("Najboljši rang po SNR: R = $best_R, SNR = $(round(best_SNR, digits=4)) dB")
+
+p_snr = plot(rangi, snr_vals, lw=2, marker=:circle, label="SNR")
+xlabel!("Rang MSSA")
+ylabel!("SNR (dB)")
+title!("SNR glede na rang (1..100)")
+vline!(p_snr, [best_R], ls=:dash, label="Najboljši rang = $best_R")
+annotate!(p_snr, (best_R, best_SNR), text("Max SNR = $(round(best_SNR, digits=2)) dB", 8, :left))
+display(p_snr)
+
+plt = plot(p_snr, p; layout=(2,1), size=(900,700))
+savefig(plt, "mssa_plots_rang02.pdf")

@@ -1,0 +1,257 @@
+using LinearAlgebra
+using Statistics
+using Random
+using Plots
+using Measures
+
+# =========================================
+# Hankel & projekcije
+# =========================================
+
+# Hankelova matrika iz vektorja d (1D)
+function hankel_matrix(d::Vector{T}) where T
+    L = length(d)
+    M = floor(Int, L/2) + 1
+    N = L - M + 1
+    H = zeros(T, M, N)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            H[i,j] = d[i + j - 1]
+        end
+    end
+    return H
+end
+
+# Inverz Hankel: povpreči antidiagonale nazaj v vektor
+function inv_hankel(H::AbstractMatrix{T}) where T
+    M, N = size(H)
+    L = M + N - 1
+    d_est = zeros(T, L)
+    counts = zeros(Int, L)
+    @inbounds for i in 1:M
+        @inbounds for j in 1:N
+            k = i + j - 1
+            d_est[k] += H[i,j]
+            counts[k] += 1
+        end
+    end
+    @inbounds for k in 1:L
+        d_est[k] /= counts[k]
+    end
+    return d_est
+end
+
+# Projekcija na Hankelovo strukturo: izenači vrednosti po antidiagonalah
+function proj_hankel(A::AbstractMatrix{T}) where T
+    M, N = size(A)
+    H_proj = similar(A)
+    L = M + N - 1
+    @inbounds for k in 1:L
+        s = zero(T)
+        cnt = 0
+        for i in 1:M
+            j = k - i + 1
+            if 1 <= j <= N
+                s += A[i,j]
+                cnt += 1
+            end
+        end
+        avg_val = s / cnt
+        for i in 1:M
+            j = k - i + 1
+            if 1 <= j <= N
+                H_proj[i,j] = avg_val
+            end
+        end
+    end
+    return H_proj
+end
+
+# =========================================
+# Adaptivni nizkorang s parametri a,b,c,d v formuli za c_val
+# c_val = a*ratio^3 - b*ratio^2 + c*ratio + d
+# =========================================
+function adaptive_proj_low_rank(A::AbstractMatrix{T};
+        a::Real=0.56, b::Real=0.95, c::Real=1.82, d::Real=1.43
+    ) where T
+    M, N = size(A)
+    ratio = M / N
+    c_val = a * ratio^3 - b * ratio^2 + c * ratio + d
+
+    U, S, V = svd(A)
+    sigma_med = median(S)
+    R = count(x -> x >= c_val * sigma_med, S)
+
+    # Če R = 0, vrnemo ničelno matriko (sledimo tvoji izvorni logiki)
+    if R == 0
+        return zeros(T, M, N)
+    end
+
+    S_trunc = zeros(eltype(S), length(S))
+    @inbounds for i in 1:min(R, length(S))
+        S_trunc[i] = S[i]
+    end
+    return U * Diagonal(S_trunc) * V'
+end
+
+# =========================================
+# Iterativni HLR denoiser (brez rekonstrukcije manjkajočih)
+# H_{k+1} = (1/(1+λ)) * P_H( D + λ * L_k )
+# L_{k+1} = adaptive_low_rank(H_{k+1})
+# =========================================
+function hlr_denoise(d::Vector{T}, Nite::Int, λ::Real;
+        a::Real=0.56, b::Real=0.95, c::Real=1.82, dcoef::Real=1.43
+    ) where T
+    D = hankel_matrix(d)
+    L = adaptive_proj_low_rank(D; a=a, b=b, c=c, d=dcoef)
+    H_mat = similar(D)
+    @inbounds for k in 1:Nite
+        H_mat = proj_hankel(D .+ λ .* L)
+        H_mat .*= (1 / (1 + λ))
+        L = adaptive_proj_low_rank(H_mat; a=a, b=b, c=c, d=dcoef)
+    end
+    s_est = inv_hankel(H_mat)
+    return s_est
+end
+
+# =========================================
+# Merilo kakovosti
+# =========================================
+compute_snr(C::Vector{T}, A::Vector{T}) where T = 10 * log10(norm(C)^2 / max(norm(C - A)^2, eps()))
+
+# =========================================
+# TEST SIGNAL
+# =========================================
+t = 1:50
+clean_signal = [sin(0.2 * i) for i in t]
+# clean_signal = [cos(0.2 * i) + 6 * (sin(0.4 *i)) + 2 * sin(0.6 *i) for i in t]
+
+rng = MersenneTwister(1234)
+noise = 0.4 .* randn(rng, length(clean_signal))
+noisy_signal = clean_signal .+ noise
+
+# Parametri HLR
+Nite = 4
+λ = 10.0
+
+# =========================================
+# Funkcija za hiter SNR preizkus za dane (a,b,c,d)
+# =========================================
+function snr_for_coeffs(a,b,c,dcoef)
+    den = hlr_denoise(noisy_signal, Nite, λ; a=a, b=b, c=c, dcoef=dcoef)
+    return compute_snr(clean_signal, den)
+end
+
+# =========================================
+# SWEPTI KOEFICIENTOV V FORMULI ZA c_val
+# - vsakič variramo EN koeficient, ostale držimo fiksne na originalu
+#   a ∈ [0.4, 0.6], b ∈ [0.8, 0.99], c ∈ [1.7, 1.9], d ∈ [1.3, 1.5]
+# =========================================
+
+a_vals = 0.40:0.02:0.60   # 11 vrednosti
+b_vals = 0.80:0.01:0.99   # 20 vrednosti
+c_vals = 1.70:0.02:1.90   # 11 vrednosti
+d_vals = 1.30:0.02:1.50   # 11 vrednosti
+
+snr_a = similar(collect(a_vals), Float64)
+snr_b = similar(collect(b_vals), Float64)
+snr_c = similar(collect(c_vals), Float64)
+snr_d = similar(collect(d_vals), Float64)
+
+# Osnovne (originalne) vrednosti
+a0, b0, c0, d0 = 0.56, 0.95, 1.82, 1.43
+
+# Sweep po a (ostalo fiksno)
+for (i, a) in enumerate(a_vals)
+    snr_a[i] = snr_for_coeffs(a, b0, c0, d0)
+end
+
+# Sweep po b
+for (i, b) in enumerate(b_vals)
+    snr_b[i] = snr_for_coeffs(a0, b, c0, d0)
+end
+
+# Sweep po c
+for (i, c_) in enumerate(c_vals)
+    snr_c[i] = snr_for_coeffs(a0, b0, c_, d0)
+end
+
+# Sweep po d
+for (i, dcoef) in enumerate(d_vals)
+    snr_d[i] = snr_for_coeffs(a0, b0, c0, dcoef)
+end
+
+# =========================================
+# Izpisi rezultatov (SNR za vsako možnost)
+# =========================================
+
+println("\n--- SNR za različne a (b=$b0, c=$c0, d=$d0) ---")
+for (a, snr) in zip(a_vals, snr_a)
+    @printf("a = %.2f  ->  SNR = %.3f dB\n", a, snr)
+end
+
+println("\n--- SNR za različne b (a=$a0, c=$c0, d=$d0) ---")
+for (b, snr) in zip(b_vals, snr_b)
+    @printf("b = %.2f  ->  SNR = %.3f dB\n", b, snr)
+end
+
+println("\n--- SNR za različne c (a=$a0, b=$b0, d=$d0) ---")
+for (c_, snr) in zip(c_vals, snr_c)
+    @printf("c = %.2f  ->  SNR = %.3f dB\n", c_, snr)
+end
+
+println("\n--- SNR za različne d (a=$a0, b=$b0, c=$c0) ---")
+for (dcoef, snr) in zip(d_vals, snr_d)
+    @printf("d = %.2f  ->  SNR = %.3f dB\n", dcoef, snr)
+end
+
+# =========================================
+# Povzetek: najboljše vrednosti in grafa
+# =========================================
+
+i_best_a = argmax(snr_a); best_a = a_vals[i_best_a]; best_snr_a = snr_a[i_best_a]
+i_best_b = argmax(snr_b); best_b = b_vals[i_best_b]; best_snr_b = snr_b[i_best_b]
+i_best_c = argmax(snr_c); best_c = c_vals[i_best_c]; best_snr_c = snr_c[i_best_c]
+i_best_d = argmax(snr_d); best_d = d_vals[i_best_d]; best_snr_d = snr_d[i_best_d]
+
+println("\n=== Povzetek najboljših ===")
+@printf("Najboljši a = %.2f  (SNR = %.3f dB)\n", best_a, best_snr_a)
+@printf("Najboljši b = %.2f  (SNR = %.3f dB)\n", best_b, best_snr_b)
+@printf("Najboljši c = %.2f  (SNR = %.3f dB)\n", best_c, best_snr_c)
+@printf("Najboljši d = %.2f  (SNR = %.3f dB)\n", best_d, best_snr_d)
+
+# Grafi (2×2)
+p1 = plot(a_vals, snr_a;
+    lw=2, marker=:circle,
+    xlabel="a", ylabel="SNR (dB)",
+    title="SNR vs a (b=$b0, c=$c0, d=$d0)",
+    left_margin=8mm, bottom_margin=6mm)
+vline!(p1, [best_a]; ls=:dash, label="a*")
+
+p2 = plot(b_vals, snr_b;
+    lw=2, marker=:circle,
+    xlabel="b", ylabel="SNR (dB)",
+    title="SNR vs b (a=$a0, c=$c0, d=$d0)",
+    left_margin=8mm, bottom_margin=6mm)
+vline!(p2, [best_b]; ls=:dash, label="b*")
+
+p3 = plot(c_vals, snr_c;
+    lw=2, marker=:circle,
+    xlabel="c", ylabel="SNR (dB)",
+    title="SNR vs c (a=$a0, b=$b0, d=$d0)",
+    left_margin=8mm, bottom_margin=6mm)
+vline!(p3, [best_c]; ls=:dash, label="c*")
+
+p4 = plot(d_vals, snr_d;
+    lw=2, marker=:circle,
+    xlabel="d", ylabel="SNR (dB)",
+    title="SNR vs d (a=$a0, b=$b0, c=$c0)",
+    left_margin=8mm, bottom_margin=6mm)
+vline!(p4, [best_d]; ls=:dash, label="d*")
+
+plt = plot(p1, p2, p3, p4;
+    layout=(2,2),
+    size=(1100,700),
+    outer_margin=5mm)  # malo zraka okoli celotne slike
+
+savefig(plt, "hlr_coeff_sweep02.pdf")

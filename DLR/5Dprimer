@@ -29,7 +29,6 @@
 # Ali iz REPL:
 #   include("dlr_5d_damped_rank_reduction.jl"); main()
 #
-# Avtor: ChatGPT (Julia implementacija)
 # -----------------------------------------------------------------------------
 
 using LinearAlgebra
@@ -492,3 +491,4 @@ end
 
 # Za zagon ob vključitvi datoteke
 main()
+

@@ -34,7 +34,6 @@
 # Or from the REPL:
 #   include("dlr_5d_damped_rank_reduction.jl"); main()
 #
-# Author: ChatGPT (Julia implementation)
 # -----------------------------------------------------------------------------
 
 using LinearAlgebra
@@ -518,3 +517,4 @@ end
 
 # Uncomment to run when file is included directly
  main()
+
